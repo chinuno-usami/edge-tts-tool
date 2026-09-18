@@ -29,6 +29,14 @@ pub struct TtsApp {
     voice_filter: String,
     is_loading_voices: bool,
 
+    // Cached dropdown data (recomputed only when the filter or voice list changes,
+    // NOT on every frame — this used to be rebuilt every repaint).
+    filtered_voices: Vec<(String, String)>,
+    selected_display: String,
+
+    // Cached text length (updated only when the text changes).
+    text_len: usize,
+
     // Audio Output Devices
     output_devices: Vec<AudioDeviceInfo>,
     selected_device_name: Option<String>,
@@ -91,7 +99,7 @@ impl TtsApp {
         let devices = list_output_devices();
         let selected_device_name = config.output_device.clone();
 
-        let app = Self {
+        let mut app = Self {
             text: config.last_text.clone(),
             rate: config.rate,
             pitch: config.pitch,
@@ -101,6 +109,9 @@ impl TtsApp {
             voices: preset_voices,
             voice_filter: String::new(),
             is_loading_voices: false,
+            filtered_voices: Vec::new(),
+            selected_display: String::new(),
+            text_len: config.last_text.chars().count(),
             output_devices: devices,
             audio_controller: AudioController::new(),
             status_text: "就绪".to_string(),
@@ -122,6 +133,9 @@ impl TtsApp {
             runtime,
         };
 
+        // Populate the cached dropdown data for the preset voices.
+        app.recompute_voice_cache();
+
         // Fetch latest online voices in the background
         app.refresh_voices_async();
 
@@ -132,6 +146,31 @@ impl TtsApp {
         self.output_devices = list_output_devices();
         self.status_text = format!("音频输出设备列表已刷新 (共 {} 个设备)", self.output_devices.len());
         self.status_color = Color32::LIGHT_BLUE;
+    }
+
+    // Rebuild the cached voice-dropdown list. Called only when the filter text or the
+    // voice list actually changes, so the per-frame ui() path no longer does a full
+    // to_lowercase + filter + display_name(format!) + collect over hundreds of voices.
+    fn recompute_voice_cache(&mut self) {
+        let filter_lower = self.voice_filter.to_lowercase();
+        self.filtered_voices = self
+            .voices
+            .iter()
+            .filter(|v| {
+                filter_lower.is_empty()
+                    || v.short_name.to_lowercase().contains(&filter_lower)
+                    || v.friendly_name.to_lowercase().contains(&filter_lower)
+                    || v.locale.to_lowercase().contains(&filter_lower)
+            })
+            .map(|v| (v.short_name.clone(), v.display_name()))
+            .collect();
+
+        self.selected_display = self
+            .voices
+            .iter()
+            .find(|v| v.short_name == self.selected_voice_name)
+            .map(|v| v.display_name())
+            .unwrap_or_else(|| self.selected_voice_name.clone());
     }
 
     fn refresh_voices_async(&self) {
@@ -268,6 +307,7 @@ impl eframe::App for TtsApp {
                     self.is_loading_voices = false;
                     if !fetched_voices.is_empty() {
                         self.voices = fetched_voices;
+                        self.recompute_voice_cache();
                         self.status_text = format!("已加载 Edge 云端语音 (共 {} 个)", self.voices.len());
                         self.status_color = Color32::LIGHT_BLUE;
                     }
@@ -378,41 +418,23 @@ impl eframe::App for TtsApp {
                     ui.label(RichText::new("🗣 语音角色:").strong());
 
                     // Quick filter text input
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.voice_filter)
-                            .hint_text("🔍 过滤角色 (如 晓晓, 云希, en-US)...")
-                            .desired_width(180.0),
-                    );
-
-                    let filter_lower = self.voice_filter.to_lowercase();
-                    let filtered_voices: Vec<(String, String)> = self
-                        .voices
-                        .iter()
-                        .filter(|v| {
-                            if filter_lower.is_empty() {
-                                true
-                            } else {
-                                v.short_name.to_lowercase().contains(&filter_lower)
-                                    || v.friendly_name.to_lowercase().contains(&filter_lower)
-                                    || v.locale.to_lowercase().contains(&filter_lower)
-                            }
-                        })
-                        .map(|v| (v.short_name.clone(), v.display_name()))
-                        .collect();
-
-                    let selected_display = self
-                        .voices
-                        .iter()
-                        .find(|v| v.short_name == self.selected_voice_name)
-                        .map(|v| v.display_name())
-                        .unwrap_or_else(|| self.selected_voice_name.clone());
+                    let filter_changed = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.voice_filter)
+                                .hint_text("🔍 过滤角色 (如 晓晓, 云希, en-US)...")
+                                .desired_width(180.0),
+                        )
+                        .changed();
+                    if filter_changed {
+                        self.recompute_voice_cache();
+                    }
 
                     let mut selected_voice_to_set = None;
                     egui::ComboBox::from_id_salt("voice_combo")
                         .width(260.0)
-                        .selected_text(selected_display)
+                        .selected_text(self.selected_display.as_str())
                         .show_ui(ui, |ui| {
-                            for (short_name, display_name) in &filtered_voices {
+                            for (short_name, display_name) in self.filtered_voices.iter() {
                                 let is_selected = self.selected_voice_name == *short_name;
                                 if ui.selectable_label(is_selected, display_name).clicked() {
                                     selected_voice_to_set = Some(short_name.clone());
@@ -422,6 +444,9 @@ impl eframe::App for TtsApp {
 
                     if let Some(new_voice) = selected_voice_to_set {
                         self.selected_voice_name = new_voice;
+                        // Sync the cached selected label so the collapsed combo shows
+                        // the newly picked voice (previously computed per-frame).
+                        self.recompute_voice_cache();
                         self.persist_config();
                     }
 
@@ -482,10 +507,11 @@ impl eframe::App for TtsApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("📝 输入要合成的文字:").strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("字数: {}", self.text.chars().count())).size(12.0));
+                    ui.label(RichText::new(format!("字数: {}", self.text_len)).size(12.0));
 
                     if ui.button("清空").clicked() {
                         self.text.clear();
+                        self.text_len = 0;
                         self.persist_config();
                     }
 
@@ -494,6 +520,7 @@ impl eframe::App for TtsApp {
                             if let Ok(paste_text) = clipboard.get_text() {
                                 if !paste_text.is_empty() {
                                     self.text.push_str(&paste_text);
+                                    self.text_len = self.text.chars().count();
                                     self.persist_config();
                                 }
                             }
@@ -511,6 +538,7 @@ impl eframe::App for TtsApp {
                         .desired_rows(8)
                         .desired_width(f32::INFINITY);
                     if ui.add(edit).changed() {
+                        self.text_len = self.text.chars().count();
                         self.persist_config();
                     }
                 });
