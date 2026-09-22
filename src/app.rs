@@ -467,30 +467,26 @@ impl eframe::App for TtsApp {
                 // Sliders: Rate, Pitch, Volume
                 ui.horizontal(|ui| {
                     ui.label("语速:");
-                    if ui
-                        .add(egui::Slider::new(&mut self.rate, -50..=100).suffix("%"))
-                        .changed()
-                    {
+                    let rate_slider = ui.add(egui::Slider::new(&mut self.rate, -50..=100).suffix("%"));
+                    if rate_slider.drag_stopped() || rate_slider.lost_focus() || rate_slider.clicked() {
                         self.persist_config();
                     }
 
                     ui.add_space(10.0);
                     ui.label("音调:");
-                    if ui
-                        .add(egui::Slider::new(&mut self.pitch, -50..=50).suffix("Hz"))
-                        .changed()
-                    {
+                    let pitch_slider = ui.add(egui::Slider::new(&mut self.pitch, -50..=50).suffix("Hz"));
+                    if pitch_slider.drag_stopped() || pitch_slider.lost_focus() || pitch_slider.clicked() {
                         self.persist_config();
                     }
 
                     ui.add_space(10.0);
                     ui.label("音量:");
-                    if ui
-                        .add(egui::Slider::new(&mut self.volume, 0..=100).suffix("%"))
-                        .changed()
-                    {
-                        self.persist_config();
+                    let vol_slider = ui.add(egui::Slider::new(&mut self.volume, 0..=100).suffix("%"));
+                    if vol_slider.changed() {
                         self.audio_controller.set_volume((self.volume as f32) / 100.0);
+                    }
+                    if vol_slider.drag_stopped() || vol_slider.lost_focus() || vol_slider.clicked() {
+                        self.persist_config();
                     }
 
                     if ui.button("重置参数").clicked() {
