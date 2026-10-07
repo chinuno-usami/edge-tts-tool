@@ -97,10 +97,13 @@ pub struct TtsApp {
     async_tx: Sender<AsyncMessage>,
     async_rx: Receiver<AsyncMessage>,
     runtime: Arc<Runtime>,
+    // Used by background tasks to wake the UI; there is no periodic repaint.
+    egui_ctx: egui::Context,
 }
 
 impl TtsApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let egui_ctx = cc.egui_ctx.clone();
         let config = AppConfig::load();
         let (async_tx, async_rx) = unbounded();
         let runtime = Arc::new(
@@ -110,7 +113,8 @@ impl TtsApp {
                 .expect("Failed to initialize tokio runtime"),
         );
 
-        let mut hotkey_manager = AppHotkeyManager::new();
+        let hotkey_ctx = egui_ctx.clone();
+        let mut hotkey_manager = AppHotkeyManager::new(move || hotkey_ctx.request_repaint());
         if let Err(e) = hotkey_manager.register(&config.hotkey) {
             log::warn!("Initial hotkey registration notice: {}", e);
         }
@@ -142,7 +146,10 @@ impl TtsApp {
             selected_display: String::new(),
             text_len: config.last_text.chars().count(),
             output_devices: devices,
-            audio_controller: AudioController::new(),
+            audio_controller: {
+                let audio_ctx = egui_ctx.clone();
+                AudioController::new(move || audio_ctx.request_repaint())
+            },
             status_text: "就绪".to_string(),
             status_color: Color32::from_rgb(100, 180, 100),
             is_playing: false,
@@ -161,6 +168,7 @@ impl TtsApp {
             async_tx,
             async_rx,
             runtime,
+            egui_ctx,
         };
 
         // Populate the cached dropdown data for the preset voices.
@@ -205,6 +213,7 @@ impl TtsApp {
 
     fn refresh_voices_async(&self) {
         let tx = self.async_tx.clone();
+        let ctx = self.egui_ctx.clone();
         self.runtime.spawn(async move {
             match fetch_voices_list().await {
                 Ok(voices) => {
@@ -214,6 +223,7 @@ impl TtsApp {
                     let _ = tx.send(AsyncMessage::VoicesLoadFailed(e.to_string()));
                 }
             }
+            ctx.request_repaint();
         });
     }
 
@@ -241,6 +251,7 @@ impl TtsApp {
 
         let text = self.text.clone();
         let tx = self.async_tx.clone();
+        let ctx = self.egui_ctx.clone();
 
         self.runtime.spawn(async move {
             match synthesize(&text, &options).await {
@@ -251,6 +262,7 @@ impl TtsApp {
                     let _ = tx.send(AsyncMessage::SynthesisFailed(e.to_string()));
                 }
             }
+            ctx.request_repaint();
         });
     }
 
@@ -498,9 +510,6 @@ impl eframe::App for TtsApp {
         if self.show_hotkey_dialog {
             self.show_hotkey_window(ctx);
         }
-
-        // Request repaint to keep UI and audio events responsive
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 }
 

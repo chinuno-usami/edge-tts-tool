@@ -23,18 +23,32 @@ pub enum AudioEvent {
     PlaybackError(String),
 }
 
+struct EventSender<F: Fn()> {
+    tx: Sender<AudioEvent>,
+    on_event: F,
+}
+
+impl<F: Fn()> EventSender<F> {
+    fn send(&self, event: AudioEvent) -> Result<(), crossbeam_channel::SendError<AudioEvent>> {
+        let result = self.tx.send(event);
+        (self.on_event)();
+        result
+    }
+}
+
 pub struct AudioController {
     cmd_tx: Sender<AudioCommand>,
     event_rx: Receiver<AudioEvent>,
 }
 
 impl AudioController {
-    pub fn new() -> Self {
+    /// `on_event` 在音频线程每次发出事件后调用，用于唤醒 UI 重绘。
+    pub fn new(on_event: impl Fn() + Send + 'static) -> Self {
         let (cmd_tx, cmd_rx) = bounded::<AudioCommand>(16);
         let (event_tx, event_rx) = bounded::<AudioEvent>(16);
 
         thread::spawn(move || {
-            run_audio_thread(cmd_rx, event_tx);
+            run_audio_thread(cmd_rx, event_tx, on_event);
         });
 
         Self { cmd_tx, event_rx }
@@ -61,13 +75,15 @@ impl AudioController {
     }
 }
 
-impl Default for AudioController {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn run_audio_thread(cmd_rx: Receiver<AudioCommand>, event_tx: Sender<AudioEvent>) {
+fn run_audio_thread(
+    cmd_rx: Receiver<AudioCommand>,
+    raw_event_tx: Sender<AudioEvent>,
+    on_event: impl Fn(),
+) {
+    let event_tx = EventSender {
+        tx: raw_event_tx,
+        on_event,
+    };
     let mut current_stream: Option<OutputStream> = None;
     let mut current_handle: Option<OutputStreamHandle> = None;
     let mut current_sink: Option<Sink> = None;

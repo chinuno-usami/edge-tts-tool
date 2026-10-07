@@ -1,3 +1,4 @@
+use crossbeam_channel::{unbounded, Receiver};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use serde::{Deserialize, Serialize};
@@ -136,14 +137,23 @@ pub fn parse_key_code(key_str: &str) -> Option<Code> {
 pub struct AppHotkeyManager {
     manager: Option<GlobalHotKeyManager>,
     active_hotkey: Option<HotKey>,
+    event_rx: Receiver<GlobalHotKeyEvent>,
 }
 
 impl AppHotkeyManager {
-    pub fn new() -> Self {
+    /// `on_event` 在热键线程中调用，用于唤醒 UI 重绘。
+    /// 注意：global-hotkey 的事件回调全局只能设置一次。
+    pub fn new(on_event: impl Fn() + Send + Sync + 'static) -> Self {
         let manager = GlobalHotKeyManager::new().ok();
+        let (event_tx, event_rx) = unbounded();
+        GlobalHotKeyEvent::set_event_handler(Some(move |event| {
+            let _ = event_tx.send(event);
+            on_event();
+        }));
         Self {
             manager,
             active_hotkey: None,
+            event_rx,
         }
     }
 
@@ -171,10 +181,9 @@ impl AppHotkeyManager {
     }
 
     pub fn poll_event(&self) -> bool {
-        let receiver = GlobalHotKeyEvent::receiver();
         let mut triggered = false;
 
-        while let Ok(event) = receiver.try_recv() {
+        while let Ok(event) = self.event_rx.try_recv() {
             if let Some(ref hotkey) = self.active_hotkey {
                 if event.id == hotkey.id() && event.state == HotKeyState::Pressed {
                     triggered = true;
