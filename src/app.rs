@@ -224,6 +224,21 @@ impl TtsApp {
         });
     }
 
+    /// 用当前文本框内容开始 TTS，成功发起后清空输入。
+    fn speak_and_clear_text(&mut self) {
+        if self.is_synthesizing {
+            return;
+        }
+        if self.text.trim().is_empty() {
+            self.start_synthesis(true);
+            return;
+        }
+        self.start_synthesis(true);
+        self.text.clear();
+        self.text_len = 0;
+        self.persist_config();
+    }
+
     fn stop_playback(&mut self) {
         self.audio_controller.stop();
         self.is_playing = false;
@@ -340,7 +355,13 @@ impl eframe::App for TtsApp {
             }
         }
 
-        // 5. Render Central GUI Panel
+        // 5. Ctrl+Enter：朗读当前文本并清空输入（在 TextEdit 之前消费，避免插入换行）
+        let ctrl_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
+        if ctrl_enter {
+            self.speak_and_clear_text();
+        }
+
+        // 6. Render Central GUI Panel
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
@@ -530,7 +551,7 @@ impl eframe::App for TtsApp {
                 .min_scrolled_height(160.0)
                 .show(ui, |ui| {
                     let edit = egui::TextEdit::multiline(&mut self.text)
-                        .hint_text("在此处输入或粘贴文字... 支持中英文及长文本。")
+                        .hint_text("在此处输入或粘贴文字... Ctrl+Enter 朗读并清空。")
                         .desired_rows(8)
                         .desired_width(f32::INFINITY);
                     if ui.add(edit).changed() {
@@ -557,6 +578,7 @@ impl eframe::App for TtsApp {
                         play_enabled,
                         egui::Button::new(RichText::new(play_btn_text).size(16.0).strong()),
                     )
+                    .on_hover_text("Ctrl+Enter：朗读当前文本并清空输入框")
                     .clicked()
                 {
                     self.start_synthesis(true);
