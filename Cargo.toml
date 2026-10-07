@@ -1,6 +1,6 @@
 [package]
 name = "edge-tts-tool"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["tts"]
 description = "Desktop Edge-TTS tool with output device selection and global hotkey"
