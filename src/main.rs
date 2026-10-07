@@ -13,6 +13,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([780.0, 600.0])
             .with_min_inner_size([420.0, 360.0])
             .with_active(true),
+        vsync: false,
         ..Default::default()
     };
 
