@@ -11,7 +11,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Edge TTS 语音合成工具")
             .with_inner_size([780.0, 600.0])
-            .with_min_inner_size([620.0, 480.0])
+            .with_min_inner_size([420.0, 360.0])
             .with_active(true),
         ..Default::default()
     };

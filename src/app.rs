@@ -9,6 +9,33 @@ use egui::{Align, Color32, Layout, RichText, ScrollArea, Vec2};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+const SPEAK_SHORTCUT_LABEL: &str = if cfg!(target_os = "macos") {
+    "Cmd+Enter"
+} else {
+    "Ctrl+Enter"
+};
+const MIN_TEXT_HEIGHT: f32 = 120.0;
+const COMPACT_WIDTH: f32 = 640.0;
+
+fn main_text_id() -> egui::Id {
+    egui::Id::new("main_text_edit")
+}
+
+fn voice_filter_id() -> egui::Id {
+    egui::Id::new("voice_filter_edit")
+}
+
+fn prosody_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    suffix: &str,
+) -> egui::Response {
+    ui.label(label);
+    ui.add(egui::Slider::new(value, range).suffix(suffix))
+}
+
 enum AsyncMessage {
     VoicesLoaded(Vec<Voice>),
     VoicesLoadFailed(String),
@@ -53,6 +80,8 @@ pub struct TtsApp {
     is_playing: bool,
     is_synthesizing: bool,
     last_audio: Option<Vec<u8>>,
+    // Text cleared by the speak shortcut; restored if that synthesis fails.
+    pending_cleared_text: Option<String>,
 
     // Global Hotkey
     hotkey_manager: AppHotkeyManager,
@@ -119,6 +148,7 @@ impl TtsApp {
             is_playing: false,
             is_synthesizing: false,
             last_audio: None,
+            pending_cleared_text: None,
             hotkey_manager,
             is_minimized: false,
             show_hotkey_dialog: false,
@@ -224,18 +254,29 @@ impl TtsApp {
         });
     }
 
-    /// 用当前文本框内容开始 TTS，成功发起后清空输入。
+    /// 用当前文本框内容开始 TTS 并清空输入；合成失败时恢复被清空的文本。
     fn speak_and_clear_text(&mut self) {
         if self.is_synthesizing {
-            return;
-        }
-        if self.text.trim().is_empty() {
-            self.start_synthesis(true);
+            self.status_text = "正在生成上一段音频，请稍候...".to_string();
+            self.status_color = Color32::YELLOW;
             return;
         }
         self.start_synthesis(true);
-        self.text.clear();
+        if !self.is_synthesizing {
+            return;
+        }
+        self.pending_cleared_text = Some(std::mem::take(&mut self.text));
         self.text_len = 0;
+        self.persist_config();
+    }
+
+    fn restore_cleared_text(&mut self, cleared: String) {
+        if self.text.is_empty() {
+            self.text = cleared;
+        } else {
+            self.text = format!("{}\n{}", cleared, self.text);
+        }
+        self.text_len = self.text.chars().count();
         self.persist_config();
     }
 
@@ -333,6 +374,7 @@ impl eframe::App for TtsApp {
                 }
                 AsyncMessage::SynthesisSuccess { audio, auto_play } => {
                     self.is_synthesizing = false;
+                    self.pending_cleared_text = None;
                     let size_kb = audio.len() as f64 / 1024.0;
                     self.status_text = format!("音频合成完毕 ({:.1} KB)", size_kb);
                     self.status_color = Color32::from_rgb(100, 220, 100);
@@ -349,221 +391,36 @@ impl eframe::App for TtsApp {
                 }
                 AsyncMessage::SynthesisFailed(err) => {
                     self.is_synthesizing = false;
-                    self.status_text = format!("合成失败: {}", err);
+                    if let Some(cleared) = self.pending_cleared_text.take() {
+                        self.restore_cleared_text(cleared);
+                        self.status_text = format!("合成失败（已恢复输入文本）: {}", err);
+                    } else {
+                        self.status_text = format!("合成失败: {}", err);
+                    }
                     self.status_color = Color32::RED;
                 }
             }
         }
 
-        // 5. Ctrl+Enter：朗读当前文本并清空输入（在 TextEdit 之前消费，避免插入换行）
-        let ctrl_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
-        if ctrl_enter {
+        // 5. Ctrl/Cmd+Enter：朗读当前文本并清空输入（在 TextEdit 之前消费，避免插入换行）。
+        // 语音过滤框或快捷键弹窗获得焦点时不拦截；额外按下 Shift/Alt 时也不触发。
+        let shortcut_allowed = !self.show_hotkey_dialog
+            && ctx.memory(|m| m.focused()) != Some(voice_filter_id());
+        let speak_shortcut = shortcut_allowed
+            && ctx.input_mut(|i| {
+                !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)
+            });
+        if speak_shortcut {
             self.speak_and_clear_text();
         }
 
-        // 6. Render Central GUI Panel
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // 6. Bottom action bar (always visible, wraps onto multiple rows when narrow)
+        egui::TopBottomPanel::bottom("action_bar").show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-
-            // --- Top Header ---
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("🔊 Edge TTS 语音合成").strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let hotkey_str = self.config.hotkey.display_string();
-                    if ui
-                        .button(RichText::new(format!("⌨ 快捷键: {}", hotkey_str)).size(12.0))
-                        .on_hover_text("点击配置全局显示/隐藏快捷键")
-                        .clicked()
-                    {
-                        self.show_hotkey_dialog = !self.show_hotkey_dialog;
-                    }
-
-                    // Status Badge
-                    ui.label(RichText::new(&self.status_text).color(self.status_color).size(13.0));
-                });
-            });
-
-            ui.separator();
-
-            // --- Audio Device Selection Bar ---
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("🎧 输出声卡 / 设备:").strong());
-
-                    let current_device_label = self
-                        .selected_device_name
-                        .as_deref()
-                        .unwrap_or("默认音频输出设备 (System Default)");
-
-                    let mut selected_dev_to_set = None;
-                    egui::ComboBox::from_id_salt("audio_device_combo")
-                        .width(360.0)
-                        .selected_text(current_device_label)
-                        .show_ui(ui, |ui| {
-                            let is_default_selected = self.selected_device_name.is_none();
-                            if ui
-                                .selectable_label(is_default_selected, "默认音频输出设备 (System Default)")
-                                .clicked()
-                            {
-                                selected_dev_to_set = Some(None);
-                            }
-
-                            for dev in &self.output_devices {
-                                let label = if dev.is_default {
-                                    format!("{} [系统默认]", dev.name)
-                                } else {
-                                    dev.name.clone()
-                                };
-
-                                let is_selected = self.selected_device_name.as_deref() == Some(&dev.name);
-                                if ui.selectable_label(is_selected, label).clicked() {
-                                    selected_dev_to_set = Some(Some(dev.name.clone()));
-                                }
-                            }
-                        });
-
-                    if let Some(new_dev) = selected_dev_to_set {
-                        self.selected_device_name = new_dev;
-                        self.persist_config();
-                    }
-
-                    if ui.button("🔄 刷新设备").clicked() {
-                        self.refresh_devices();
-                    }
-                });
-            });
-
-            // --- Voice Selection & Parameter Sliders ---
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("🗣 语音角色:").strong());
-
-                    // Quick filter text input
-                    let filter_changed = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.voice_filter)
-                                .hint_text("🔍 过滤角色 (如 晓晓, 云希, en-US)...")
-                                .desired_width(180.0),
-                        )
-                        .changed();
-                    if filter_changed {
-                        self.recompute_voice_cache();
-                    }
-
-                    let mut selected_voice_to_set = None;
-                    egui::ComboBox::from_id_salt("voice_combo")
-                        .width(260.0)
-                        .selected_text(self.selected_display.as_str())
-                        .show_ui(ui, |ui| {
-                            for (short_name, display_name) in self.filtered_voices.iter() {
-                                let is_selected = self.selected_voice_name == *short_name;
-                                if ui.selectable_label(is_selected, display_name).clicked() {
-                                    selected_voice_to_set = Some(short_name.clone());
-                                }
-                            }
-                        });
-
-                    if let Some(new_voice) = selected_voice_to_set {
-                        self.selected_voice_name = new_voice;
-                        // Sync the cached selected label so the collapsed combo shows
-                        // the newly picked voice (previously computed per-frame).
-                        self.recompute_voice_cache();
-                        self.persist_config();
-                    }
-
-                    if ui
-                        .button("☁ 刷新云端语音")
-                        .on_hover_text("从 Microsoft Edge 服务器拉取最新完整语音列表")
-                        .clicked()
-                    {
-                        self.is_loading_voices = true;
-                        self.status_text = "正在获取微软云端全部语音列表...".to_string();
-                        self.status_color = Color32::LIGHT_BLUE;
-                        self.refresh_voices_async();
-                    }
-                });
-
-                ui.add_space(4.0);
-
-                // Sliders: Rate, Pitch, Volume
-                ui.horizontal(|ui| {
-                    ui.label("语速:");
-                    let rate_slider = ui.add(egui::Slider::new(&mut self.rate, -50..=100).suffix("%"));
-                    if rate_slider.drag_stopped() || rate_slider.lost_focus() || rate_slider.clicked() {
-                        self.persist_config();
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label("音调:");
-                    let pitch_slider = ui.add(egui::Slider::new(&mut self.pitch, -50..=50).suffix("Hz"));
-                    if pitch_slider.drag_stopped() || pitch_slider.lost_focus() || pitch_slider.clicked() {
-                        self.persist_config();
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label("音量:");
-                    let vol_slider = ui.add(egui::Slider::new(&mut self.volume, 0..=100).suffix("%"));
-                    if vol_slider.changed() {
-                        self.audio_controller.set_volume((self.volume as f32) / 100.0);
-                    }
-                    if vol_slider.drag_stopped() || vol_slider.lost_focus() || vol_slider.clicked() {
-                        self.persist_config();
-                    }
-
-                    if ui.button("重置参数").clicked() {
-                        self.rate = 0;
-                        self.pitch = 0;
-                        self.volume = 100;
-                        self.persist_config();
-                        self.audio_controller.set_volume(1.0);
-                    }
-                });
-            });
-
-            // --- Text Input Area ---
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("📝 输入要合成的文字:").strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("字数: {}", self.text_len)).size(12.0));
-
-                    if ui.button("清空").clicked() {
-                        self.text.clear();
-                        self.text_len = 0;
-                        self.persist_config();
-                    }
-
-                    if ui.button("粘贴").clicked() {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            if let Ok(paste_text) = clipboard.get_text() {
-                                if !paste_text.is_empty() {
-                                    self.text.push_str(&paste_text);
-                                    self.text_len = self.text.chars().count();
-                                    self.persist_config();
-                                }
-                            }
-                        }
-                    }
-                });
-            });
-
-            ScrollArea::vertical()
-                .max_height(240.0)
-                .min_scrolled_height(160.0)
-                .show(ui, |ui| {
-                    let edit = egui::TextEdit::multiline(&mut self.text)
-                        .hint_text("在此处输入或粘贴文字... Ctrl+Enter 朗读并清空。")
-                        .desired_rows(8)
-                        .desired_width(f32::INFINITY);
-                    if ui.add(edit).changed() {
-                        self.text_len = self.text.chars().count();
-                        self.persist_config();
-                    }
-                });
-
-            ui.add_space(6.0);
-
-            // --- Action Buttons ---
-            ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
                 let play_btn_text = if self.is_synthesizing {
                     "⏳ 正在生成..."
                 } else if self.is_playing {
@@ -578,19 +435,23 @@ impl eframe::App for TtsApp {
                         play_enabled,
                         egui::Button::new(RichText::new(play_btn_text).size(16.0).strong()),
                     )
-                    .on_hover_text("Ctrl+Enter：朗读当前文本并清空输入框")
+                    .on_hover_text(format!(
+                        "点击朗读当前文本；{}：朗读并清空输入框",
+                        SPEAK_SHORTCUT_LABEL
+                    ))
                     .clicked()
                 {
                     self.start_synthesis(true);
                 }
 
-                if self.is_playing {
-                    if ui
-                        .add(egui::Button::new(RichText::new("⏹ 停止播放").size(16.0).color(Color32::LIGHT_RED)))
+                if self.is_playing
+                    && ui
+                        .add(egui::Button::new(
+                            RichText::new("⏹ 停止播放").size(16.0).color(Color32::LIGHT_RED),
+                        ))
                         .clicked()
-                    {
-                        self.stop_playback();
-                    }
+                {
+                    self.stop_playback();
                 }
 
                 let save_enabled = self.last_audio.is_some();
@@ -605,93 +466,346 @@ impl eframe::App for TtsApp {
                     self.save_audio_file();
                 }
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .button(RichText::new("🗕 最小化隐藏").size(13.0))
-                        .on_hover_text("最小化隐藏窗口，可通过快捷键随时唤出")
-                        .clicked()
-                    {
-                        self.is_minimized = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    }
-                });
+                if ui
+                    .button(RichText::new("🗕 最小化隐藏").size(13.0))
+                    .on_hover_text("最小化隐藏窗口，可通过快捷键随时唤出")
+                    .clicked()
+                {
+                    self.is_minimized = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
             });
-
-            // --- Hotkey Configuration Modal Window ---
-            if self.show_hotkey_dialog {
-                egui::Window::new("⚙ 配置全局快捷键")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                    .show(ctx, |ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-                        ui.label("设置按下后快速 显示 / 最小化隐藏 本窗口的全局快捷键：");
-
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.temp_hotkey_ctrl, "Ctrl");
-                            ui.checkbox(&mut self.temp_hotkey_alt, "Alt");
-                            ui.checkbox(&mut self.temp_hotkey_shift, "Shift");
-                            ui.checkbox(&mut self.temp_hotkey_meta, "Win");
-
-                            ui.label("+ 按键:");
-                            egui::ComboBox::from_id_salt("hotkey_key_combo")
-                                .selected_text(&self.temp_hotkey_key)
-                                .show_ui(ui, |ui| {
-                                    let keys = [
-                                        "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG",
-                                        "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN",
-                                        "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU",
-                                        "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Space", "F1",
-                                        "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10",
-                                        "F11", "F12",
-                                    ];
-                                    for k in keys {
-                                        ui.selectable_value(&mut self.temp_hotkey_key, k.to_string(), k);
-                                    }
-                                });
-                        });
-
-                        let candidate_config = HotkeyConfig {
-                            ctrl: self.temp_hotkey_ctrl,
-                            alt: self.temp_hotkey_alt,
-                            shift: self.temp_hotkey_shift,
-                            meta: self.temp_hotkey_meta,
-                            key: self.temp_hotkey_key.clone(),
-                        };
-
-                        ui.label(format!("当前预览: {}", candidate_config.display_string()));
-
-                        ui.horizontal(|ui| {
-                            if ui.button("保存并生效").clicked() {
-                                match self.hotkey_manager.register(&candidate_config) {
-                                    Ok(_) => {
-                                        self.config.hotkey = candidate_config;
-                                        self.persist_config();
-                                        self.show_hotkey_dialog = false;
-                                        self.status_text = "全局快捷键更新成功".to_string();
-                                        self.status_color = Color32::from_rgb(100, 220, 100);
-                                    }
-                                    Err(e) => {
-                                        self.status_text = format!("快捷键注册失败: {}", e);
-                                        self.status_color = Color32::RED;
-                                    }
-                                }
-                            }
-
-                            if ui.button("取消").clicked() {
-                                self.temp_hotkey_ctrl = self.config.hotkey.ctrl;
-                                self.temp_hotkey_alt = self.config.hotkey.alt;
-                                self.temp_hotkey_shift = self.config.hotkey.shift;
-                                self.temp_hotkey_meta = self.config.hotkey.meta;
-                                self.temp_hotkey_key = self.config.hotkey.key.clone();
-                                self.show_hotkey_dialog = false;
-                            }
-                        });
-                    });
-            }
+            ui.add_space(4.0);
         });
+
+        // 7. Central panel: scrolls as a whole when the window is too small,
+        // otherwise the text area stretches to fill the remaining height.
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+            let viewport_height = ui.available_height();
+
+            ScrollArea::vertical()
+                .id_salt("main_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let content_top = ui.cursor().top();
+                    self.show_settings(ui);
+                    self.show_text_input(ui, viewport_height - (ui.cursor().top() - content_top));
+                });
+        });
+
+        // 8. Hotkey Configuration Modal Window
+        if self.show_hotkey_dialog {
+            self.show_hotkey_window(ctx);
+        }
 
         // Request repaint to keep UI and audio events responsive
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+}
+
+impl TtsApp {
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        // --- Top Header ---
+        ui.horizontal_wrapped(|ui| {
+            ui.heading(RichText::new("🔊 Edge TTS 语音合成").strong());
+            let hotkey_str = self.config.hotkey.display_string();
+            if ui
+                .button(RichText::new(format!("⌨ 快捷键: {}", hotkey_str)).size(12.0))
+                .on_hover_text("点击配置全局显示/隐藏快捷键")
+                .clicked()
+            {
+                self.show_hotkey_dialog = !self.show_hotkey_dialog;
+            }
+            ui.label(RichText::new(&self.status_text).color(self.status_color).size(13.0));
+        });
+
+        ui.separator();
+
+        // --- Audio Device Selection Bar ---
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("🎧 输出声卡 / 设备:").strong());
+
+                let current_device_label = self
+                    .selected_device_name
+                    .as_deref()
+                    .unwrap_or("默认音频输出设备 (System Default)");
+
+                let combo_width = (ui.available_width() - 110.0).clamp(160.0, 360.0);
+                let mut selected_dev_to_set = None;
+                egui::ComboBox::from_id_salt("audio_device_combo")
+                    .width(combo_width)
+                    .truncate()
+                    .selected_text(current_device_label)
+                    .show_ui(ui, |ui| {
+                        let is_default_selected = self.selected_device_name.is_none();
+                        if ui
+                            .selectable_label(is_default_selected, "默认音频输出设备 (System Default)")
+                            .clicked()
+                        {
+                            selected_dev_to_set = Some(None);
+                        }
+
+                        for dev in &self.output_devices {
+                            let label = if dev.is_default {
+                                format!("{} [系统默认]", dev.name)
+                            } else {
+                                dev.name.clone()
+                            };
+
+                            let is_selected = self.selected_device_name.as_deref() == Some(&dev.name);
+                            if ui.selectable_label(is_selected, label).clicked() {
+                                selected_dev_to_set = Some(Some(dev.name.clone()));
+                            }
+                        }
+                    });
+
+                if let Some(new_dev) = selected_dev_to_set {
+                    self.selected_device_name = new_dev;
+                    self.persist_config();
+                }
+
+                if ui.button("🔄 刷新设备").clicked() {
+                    self.refresh_devices();
+                }
+            });
+        });
+
+        // --- Voice Selection & Parameter Sliders ---
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("🗣 语音角色:").strong());
+
+                // Quick filter text input
+                let filter_width = (ui.available_width() * 0.35).clamp(120.0, 180.0);
+                let filter_changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.voice_filter)
+                            .id(voice_filter_id())
+                            .hint_text("🔍 过滤角色 (如 晓晓, 云希, en-US)...")
+                            .desired_width(filter_width),
+                    )
+                    .changed();
+                if filter_changed {
+                    self.recompute_voice_cache();
+                }
+
+                let combo_width = (ui.available_width() - 130.0).clamp(160.0, 260.0);
+                let mut selected_voice_to_set = None;
+                egui::ComboBox::from_id_salt("voice_combo")
+                    .width(combo_width)
+                    .truncate()
+                    .selected_text(self.selected_display.as_str())
+                    .show_ui(ui, |ui| {
+                        for (short_name, display_name) in self.filtered_voices.iter() {
+                            let is_selected = self.selected_voice_name == *short_name;
+                            if ui.selectable_label(is_selected, display_name).clicked() {
+                                selected_voice_to_set = Some(short_name.clone());
+                            }
+                        }
+                    });
+
+                if let Some(new_voice) = selected_voice_to_set {
+                    self.selected_voice_name = new_voice;
+                    // Sync the cached selected label so the collapsed combo shows
+                    // the newly picked voice (previously computed per-frame).
+                    self.recompute_voice_cache();
+                    self.persist_config();
+                }
+
+                if ui
+                    .button("☁ 刷新云端语音")
+                    .on_hover_text("从 Microsoft Edge 服务器拉取最新完整语音列表")
+                    .clicked()
+                {
+                    self.is_loading_voices = true;
+                    self.status_text = "正在获取微软云端全部语音列表...".to_string();
+                    self.status_color = Color32::LIGHT_BLUE;
+                    self.refresh_voices_async();
+                }
+            });
+
+            ui.add_space(4.0);
+            self.show_prosody_controls(ui);
+        });
+    }
+
+    // Sliders: Rate, Pitch, Volume. One row when wide, a label/slider grid when narrow.
+    fn show_prosody_controls(&mut self, ui: &mut egui::Ui) {
+        let compact = ui.available_width() < COMPACT_WIDTH;
+        if compact {
+            ui.spacing_mut().slider_width = (ui.available_width() - 140.0).clamp(80.0, 320.0);
+        }
+
+        let body = |ui: &mut egui::Ui| {
+            let separate = |ui: &mut egui::Ui| {
+                if compact {
+                    ui.end_row();
+                } else {
+                    ui.add_space(10.0);
+                }
+            };
+            let rate = prosody_slider(ui, "语速:", &mut self.rate, -50..=100, "%");
+            separate(ui);
+            let pitch = prosody_slider(ui, "音调:", &mut self.pitch, -50..=50, "Hz");
+            separate(ui);
+            let volume = prosody_slider(ui, "音量:", &mut self.volume, 0..=100, "%");
+            separate(ui);
+            if compact {
+                ui.label("");
+            }
+            let reset = ui.button("重置参数").clicked();
+            (rate, pitch, volume, reset)
+        };
+
+        let (rate, pitch, volume, reset) = if compact {
+            egui::Grid::new("prosody_grid")
+                .num_columns(2)
+                .spacing(Vec2::new(8.0, 6.0))
+                .show(ui, body)
+                .inner
+        } else {
+            ui.horizontal(body).inner
+        };
+
+        let committed = |r: &egui::Response| r.drag_stopped() || r.lost_focus() || r.clicked();
+        if volume.changed() {
+            self.audio_controller.set_volume((self.volume as f32) / 100.0);
+        }
+        if committed(&rate) || committed(&pitch) || committed(&volume) {
+            self.persist_config();
+        }
+        if reset {
+            self.rate = 0;
+            self.pitch = 0;
+            self.volume = 100;
+            self.persist_config();
+            self.audio_controller.set_volume(1.0);
+        }
+    }
+
+    fn show_text_input(&mut self, ui: &mut egui::Ui, remaining_height: f32) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("📝 输入要合成的文字:").strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format!("字数: {}", self.text_len)).size(12.0));
+
+                if ui.button("清空").clicked() {
+                    self.text.clear();
+                    self.text_len = 0;
+                    self.persist_config();
+                }
+
+                if ui.button("粘贴").clicked() {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(paste_text) = clipboard.get_text() {
+                            if !paste_text.is_empty() {
+                                self.text.push_str(&paste_text);
+                                self.text_len = self.text.chars().count();
+                                self.persist_config();
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        // The header row above is not yet counted in remaining_height.
+        let header_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+        let text_height = (remaining_height - header_height - 8.0).max(MIN_TEXT_HEIGHT);
+
+        ScrollArea::vertical()
+            .id_salt("text_scroll")
+            .max_height(text_height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let edit = egui::TextEdit::multiline(&mut self.text)
+                    .id(main_text_id())
+                    .hint_text(format!(
+                        "在此处输入或粘贴文字... {} 朗读并清空。",
+                        SPEAK_SHORTCUT_LABEL
+                    ))
+                    .min_size(Vec2::new(0.0, text_height))
+                    .desired_width(f32::INFINITY);
+                if ui.add(edit).changed() {
+                    self.text_len = self.text.chars().count();
+                    self.persist_config();
+                }
+            });
+    }
+
+    fn show_hotkey_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("⚙ 配置全局快捷键")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                ui.label("设置按下后快速 显示 / 最小化隐藏 本窗口的全局快捷键：");
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.temp_hotkey_ctrl, "Ctrl");
+                    ui.checkbox(&mut self.temp_hotkey_alt, "Alt");
+                    ui.checkbox(&mut self.temp_hotkey_shift, "Shift");
+                    ui.checkbox(&mut self.temp_hotkey_meta, "Win");
+
+                    ui.label("+ 按键:");
+                    egui::ComboBox::from_id_salt("hotkey_key_combo")
+                        .selected_text(&self.temp_hotkey_key)
+                        .show_ui(ui, |ui| {
+                            let keys = [
+                                "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG",
+                                "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN",
+                                "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU",
+                                "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Space", "F1",
+                                "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10",
+                                "F11", "F12",
+                            ];
+                            for k in keys {
+                                ui.selectable_value(&mut self.temp_hotkey_key, k.to_string(), k);
+                            }
+                        });
+                });
+
+                let candidate_config = HotkeyConfig {
+                    ctrl: self.temp_hotkey_ctrl,
+                    alt: self.temp_hotkey_alt,
+                    shift: self.temp_hotkey_shift,
+                    meta: self.temp_hotkey_meta,
+                    key: self.temp_hotkey_key.clone(),
+                };
+
+                ui.label(format!("当前预览: {}", candidate_config.display_string()));
+
+                ui.horizontal(|ui| {
+                    if ui.button("保存并生效").clicked() {
+                        match self.hotkey_manager.register(&candidate_config) {
+                            Ok(_) => {
+                                self.config.hotkey = candidate_config;
+                                self.persist_config();
+                                self.show_hotkey_dialog = false;
+                                self.status_text = "全局快捷键更新成功".to_string();
+                                self.status_color = Color32::from_rgb(100, 220, 100);
+                            }
+                            Err(e) => {
+                                self.status_text = format!("快捷键注册失败: {}", e);
+                                self.status_color = Color32::RED;
+                            }
+                        }
+                    }
+
+                    if ui.button("取消").clicked() {
+                        self.temp_hotkey_ctrl = self.config.hotkey.ctrl;
+                        self.temp_hotkey_alt = self.config.hotkey.alt;
+                        self.temp_hotkey_shift = self.config.hotkey.shift;
+                        self.temp_hotkey_meta = self.config.hotkey.meta;
+                        self.temp_hotkey_key = self.config.hotkey.key.clone();
+                        self.show_hotkey_dialog = false;
+                    }
+                });
+            });
     }
 }
