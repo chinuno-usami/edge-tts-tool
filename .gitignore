@@ -3,3 +3,4 @@
 *.mp3
 .DS_Store
 tts_config.json
+/dist
