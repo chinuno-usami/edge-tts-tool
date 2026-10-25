@@ -1,14 +1,40 @@
 #[cfg(test)]
 mod tests {
     use edge_tts_tool::config::AppConfig;
-    use edge_tts_tool::edge_tts::{build_ssml, escape_xml, generate_sec_ms_gec, SpeakOptions};
+    use edge_tts_tool::edge_tts::{build_ssml, escape_xml, generate_sec_ms_gec, generate_sec_ms_gec_at, SpeakOptions};
     use edge_tts_tool::hotkey::HotkeyConfig;
 
     #[test]
     fn test_sec_ms_gec_format() {
         let token = generate_sec_ms_gec();
-        assert_eq!(token.len(), 64);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        let parts: Vec<&str> = token.split('-').collect();
+        assert_eq!(parts.len(), 2, "v2 token must be <cs64>-<sha256>: {}", token);
+        assert_eq!(parts[0].len(), 16);
+        assert_eq!(parts[1].len(), 64);
+        assert!(token
+            .chars()
+            .all(|c| c == '-' || (c.is_ascii_hexdigit() && !c.is_ascii_lowercase())));
+    }
+
+    #[test]
+    fn test_sec_ms_gec_known_vectors() {
+        // 参考向量来自 edge-tts 7.3.1 的 DRM.generate_sec_ms_gec_v2()
+        assert_eq!(
+            generate_sec_ms_gec_at(1750000000),
+            "B029A7426816F097-4579D112DC47FC3BF432B499C0A282F427C659474AF9BF5FA33CE2C003F9E9C2"
+        );
+        assert_eq!(
+            generate_sec_ms_gec_at(1700000000),
+            "2CD23A2CA0B2595A-F3C846C370E05F9CC83ACC5F995C5F5D87A4D0F14CE8936A0F902E64099E38A2"
+        );
+        assert_eq!(
+            generate_sec_ms_gec_at(1234567890),
+            "BA405D1577B8E0CE-61F01E88539977A1A1E969572D82EECFA45FB1E5DEBD122D6ACBAF0054F959E5"
+        );
+        assert_eq!(
+            generate_sec_ms_gec_at(1800000000),
+            "99E54519B490BE5C-E162DB0977FBDCB9B86DD8148BF1BCDC3C0303176CE39852A42B415935C20654"
+        );
     }
 
     #[test]
