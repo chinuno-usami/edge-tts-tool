@@ -170,14 +170,7 @@ pub async fn synthesize(
         return Err("经典 TTS 模型（如 tts-1）需要填写 voice".into());
     }
 
-    // Unsupported models omit clone refs in from_parts; only validate paths when used.
-    let ref_audio = cfg.ref_audio.trim();
-    if !ref_audio.is_empty()
-        && model_supports_voice_clone_refs(&cfg.model)
-        && !std::path::Path::new(ref_audio).is_file()
-    {
-        return Err(format!("参考音频文件不存在或不可读: {}", ref_audio).into());
-    }
+    // ref_audio is a server-side path; do not validate existence on the client.
 
     let url = join_speech_url(&cfg.base_url);
     let body = OpenAiSpeechRequest::from_parts(text, rate, cfg);

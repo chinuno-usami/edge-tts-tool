@@ -44,8 +44,9 @@ pub struct OpenAiConfig {
     /// Natural-language voice/style description; sent as JSON `instruct` when non-empty.
     #[serde(default)]
     pub instruct: String,
-    /// Local path to reference audio for voice cloning (Qwen3-TTS Base / mlx-audio).
+    /// Server-side path to reference audio for voice cloning (Qwen3-TTS Base / mlx-audio).
     /// Sent as JSON `ref_audio` when non-empty; the TTS server must be able to read this path.
+    /// Not validated on the client (client and server may be different machines).
     #[serde(default)]
     pub ref_audio: String,
     /// Exact transcript of `ref_audio`; sent as JSON `ref_text` when non-empty.

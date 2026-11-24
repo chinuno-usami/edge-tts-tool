@@ -72,7 +72,7 @@ Windows Release 产物：`target\release\edge-tts-tool.exe`（crate 名暂未改
 | `model` | 如 `tts-1` 或 `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16` |
 | `voice` | 可空；VoiceDesign 主要靠 `instruct`；与 `ref_audio`/`ref_text` 同时使用时会被省略 |
 | `instruct` | 自然语言音色/风格描述；空则不发送该 JSON 字段 |
-| `ref_audio` | 语音克隆参考音频**本地路径**（mlx-audio 服务需可读）；空则不发送 |
+| `ref_audio` | 语音克隆参考音频的**服务端路径**（由 mlx-audio 所在机器读取；客户端不做存在性校验）；空则不发送 |
 | `ref_text` | 参考音频逐字稿；空则不发送 |
 | `fetch_remote_voices` | 默认 `false`；为 true 时尝试 `GET /v1/audio/voices?model=...` |
 
@@ -145,7 +145,7 @@ curl -X POST 'http://127.0.0.1:8081/v1/audio/speech' \
   --output /tmp/mlx-tts-clone.mp3
 ```
 
-> `ref_audio` 按 mlx-audio 约定发送**服务端可读取的本地路径**（本机桌面客户端通常选本机绝对路径）。远程服务若不能访问该路径，克隆会失败。
+> `ref_audio` 按 mlx-audio 约定发送**服务端可读取的路径**。客户端与服务端可不在同一台机器，因此客户端不会校验该路径是否存在；请填写 TTS 服务所在机器上的可读路径。
 
 ### ⚠ API Key 安全
 

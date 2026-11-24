@@ -388,16 +388,6 @@ impl TtsApp {
                 self.status_color = Color32::YELLOW;
                 return;
             }
-            let ref_audio = self.config.openai.ref_audio.trim();
-            if !ref_audio.is_empty()
-                && openai_tts::model_supports_voice_clone_refs(&self.config.openai.model)
-                && !std::path::Path::new(ref_audio).is_file()
-            {
-                self.status_text =
-                    format!("参考音频文件不存在或不可读: {}", ref_audio);
-                self.status_color = Color32::YELLOW;
-                return;
-            }
         }
 
         self.synthesis_generation = self.synthesis_generation.wrapping_add(1);
@@ -1097,7 +1087,7 @@ impl TtsApp {
                 ui.label(RichText::new("🎙 语音克隆（Qwen3-TTS Base）").strong());
                 ui.label(
                     RichText::new(
-                        "mlx-audio 需要能读取本地路径；克隆时请使用 Base 模型，且不要依赖 Voice",
+                        "ref_audio 是服务端可读路径（客户端与服务端可不在同一台机器）；请使用 Base 模型，且不要依赖 Voice",
                     )
                     .size(12.0)
                     .color(Color32::GRAY),
@@ -1108,7 +1098,7 @@ impl TtsApp {
                     let path_width = (ui.available_width() - 140.0).clamp(160.0, 420.0);
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.config.openai.ref_audio)
-                            .hint_text("/path/to/reference.wav")
+                            .hint_text("/server/path/to/reference.wav")
                             .desired_width(path_width),
                     );
                     if resp.changed() || resp.lost_focus() {
@@ -1158,7 +1148,7 @@ impl TtsApp {
                     && self.config.openai.ref_audio.trim().is_empty()
                 {
                     ui.label(
-                        RichText::new("提示：Base 语音克隆建议选择 Ref Audio，并尽量填写 Ref Text")
+                        RichText::new("提示：Base 语音克隆建议填写服务端 Ref Audio 路径，并尽量填写 Ref Text")
                             .size(12.0)
                             .color(Color32::YELLOW),
                     );
