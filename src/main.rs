@@ -9,7 +9,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Edge TTS 语音合成工具")
+            .with_title("TTS 语音合成工具")
             .with_inner_size([780.0, 600.0])
             .with_min_inner_size([420.0, 360.0])
             .with_active(true),
@@ -17,7 +17,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Edge TTS 语音合成工具",
+        "TTS 语音合成工具",
         native_options,
         Box::new(|cc| {
             // Setup Chinese system fonts for clean glyph rendering

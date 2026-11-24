@@ -1,22 +1,26 @@
-# Edge TTS 语音合成桌面工具 (Edge TTS Desktop Tool)
+# TTS 语音合成桌面工具
 
-基于 **Rust** 开发的高性能微软 Edge-TTS 语音合成桌面客户端，专为 **Windows** 平台打造（兼具跨平台能力）。支持自然神经语音合成、声卡输出设备选择（如物理扬声器、耳机或虚拟音频线 VB-Cable）、全局快捷键显示/最小化隐藏窗口、参数调节以及 MP3 导出。
+基于 **Rust** 开发的跨平台语音合成桌面客户端。支持：
+
+1. **Edge-TTS**（微软 Edge Read Aloud，WebSocket + `Sec-MS-GEC`）
+2. **OpenAI 兼容** HTTP `POST /v1/audio/speech`（官方 OpenAI、自建网关、本地 `mlx-audio` / Qwen3 VoiceDesign 等）
+
+并提供声卡输出设备选择、全局快捷键、语速/音量调节、MP3 导出。
 
 ---
 
 ## ✨ 核心特性
 
-- 🎙 **高质量神经语音**：集成微软 Edge Read Aloud 在线语音合成服务，内置动态 `Sec-MS-GEC` v2 鉴权令牌（`CS64` + `SHA256`，版本前缀 `2-`，5 分钟滚动窗口），无需购买 Azure 官方 API 密钥。
-- 🎧 **指定输出设备路由**：支持枚举系统所有音频输出设备，并在下拉菜单中直接选择将声音输出至扬声器、耳机或虚拟声卡（如 VB-Audio Virtual Cable、Voicemeeter，适合直播推流或变声器路由）。
-- ⌨ **全局快捷键呼出/隐藏**：支持全局系统快捷键（默认 `Ctrl + Shift + T`，可在设置窗口中自定义为任意组合键），一键最小化隐藏或还原聚焦。
-- 🎚 **语速、音调、音量精细调节**：
-  - 语速（-50% ~ +100%）
-  - 音调（-50Hz ~ +50Hz）
-  - 音量（0% ~ 100%）
-- 🗂 **内置丰富中文与多国预设**：预置微软晓晓（温暖女声）、云希（生动男声）、云健（旁白/影视解说）、晓伊、东北话晓北、陕西话晓妮、台湾普通话、粤语、英语与日语角色，并支持一键在线获取微软全部云端角色。
-- 💾 **音频保存与导出**：支持一键将合成的高品质语音保存为本地 `.mp3` 文件。
-- 🎨 **原生优雅 GUI**：基于 `eframe` / `egui`，内存占用极低（~30MB），自动匹配 Windows 微软雅黑（Microsoft YaHei）中文字体，Release 模式自动隐藏 CMD 黑框（`windows_subsystem = "windows"`）。
-- ⚙ **配置持久化**：自动保存上次使用的语音角色、输出设备、语速/音调/音量及自定义快捷键。
+- 🎙 **双 TTS 源**：Edge-TTS 与 OpenAI Compatible 可在 UI 中一键切换；旧配置默认仍走 Edge。
+- 🧪 **本地大模型友好**：API Key 可留空；支持扩展字段 **`instruct`**（自然语言音色描述），适配 Qwen3-TTS VoiceDesign。
+- 🎧 **指定输出设备路由**：枚举系统音频输出，可路由到扬声器、耳机或虚拟声卡（VB-Cable / Voicemeeter 等）。
+- ⌨ **全局快捷键呼出/隐藏**：默认 `Ctrl + Shift + T`，可自定义。
+- 🎚 **参数调节**：
+  - Edge：语速 / 音调 / 音量
+  - OpenAI 兼容：语速 → `speed`；音调灰显（请用 Instruct）；音量仍控制本地播放
+- 🗂 **语音列表**：Edge 预设 + 云端拉取；OpenAI 预设（alloy/echo/...）+ 可手填/留空 voice
+- 💾 **MP3 导出**：合成结果可保存为 `.mp3`
+- ⚙ **配置持久化**：JSON 保存源、OpenAI 配置（含 `instruct`）、按源记忆 voice 等
 
 ---
 
@@ -24,93 +28,155 @@
 
 ```
 tts/
-├── Cargo.toml               # 项目配置与依赖清单
-├── .gitignore
+├── Cargo.toml
 ├── README.md
+├── docs/
+│   └── openai-compatible-tts-implementation-plan.md
 ├── src/
-│   ├── main.rs              # 程序入口，窗口初始化与中文字体注册
-│   ├── lib.rs               # 库导出，便于测试与模块化
-│   ├── app.rs               # GUI 主界面、交互逻辑、事件响应
-│   ├── edge_tts/            # Edge-TTS 客户端模块
-│   │   ├── mod.rs           # 接口导出
-│   │   ├── client.rs        # WebSocket 连接、Sec-MS-GEC 算法、SSML 生成
-│   │   ├── voices.rs        # 预设与云端角色列表拉取
-│   │   └── types.rs         # 核心数据结构 (Voice, SpeakOptions)
-│   ├── audio/               # 音频驱动与播放
-│   │   ├── mod.rs           # 接口导出
-│   │   ├── devices.rs       # 基于 cpal 的音频输出设备枚举
-│   │   └── player.rs        # 基于 rodio 的独立音频播放线程与设备路由
-│   ├── hotkey/              # 全局系统快捷键管理 (global-hotkey)
-│   │   └── mod.rs           # 快捷键注册、序列化与轮询
-│   ├── config.rs            # 用户偏好设置持久化 (JSON)
-│   └── font.rs              # 中文字体自动加载 (Windows 微软雅黑 / macOS 苹方)
+│   ├── main.rs              # 入口与窗口标题
+│   ├── lib.rs
+│   ├── app.rs               # GUI、源切换、合成分发
+│   ├── edge_tts/            # Edge-TTS WebSocket 客户端
+│   ├── openai_tts/          # OpenAI 兼容 /v1/audio/speech 客户端
+│   │   ├── client.rs        # synthesize / URL join / speed 映射
+│   │   └── voices.rs        # 预设与可选远程 voices
+│   ├── audio/
+│   ├── hotkey/
+│   ├── config.rs            # AppConfig / TtsSource / OpenAiConfig
+│   └── font.rs
 └── tests/
-    └── app_tests.rs         # 单元与集成测试套件
+    └── app_tests.rs
 ```
 
 ---
 
 ## 🚀 编译与运行
 
-### 1. Windows 环境直接构建运行
-
-在 Windows 电脑上安装好 Rust 工具链后，进入项目根目录：
-
 ```bash
-# 调试模式运行
 cargo run
-
-# 构建 Windows Release 生产可执行文件 (无黑框控制台)
 cargo build --release
 ```
-编译产物位于 `target\release\edge-tts-tool.exe`，直接双击即可运行！
 
-### 2. 跨平台交叉编译至 Windows (可选)
+Windows Release 产物：`target\release\edge-tts-tool.exe`（crate 名暂未改）。
 
-如果在 Linux 或 macOS 上构建 Windows 二进制文件，可借助 `cargo-xwin`：
+---
+
+## 📡 OpenAI 兼容源
+
+### 配置字段（`config.json` → `openai`）
+
+| 字段 | 说明 |
+|------|------|
+| `base_url` | 服务根地址，如 `https://api.openai.com` 或 `http://127.0.0.1:8081`（可带/不带 `/v1`） |
+| `api_key` | **可选**；非空时才加 `Authorization: Bearer ...`；本地服务可留空 |
+| `model` | 如 `tts-1` 或 `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16` |
+| `voice` | 可空；VoiceDesign 主要靠 `instruct`；与 `ref_audio`/`ref_text` 同时使用时会被省略 |
+| `instruct` | 自然语言音色/风格描述；空则不发送该 JSON 字段 |
+| `ref_audio` | 语音克隆参考音频**本地路径**（mlx-audio 服务需可读）；空则不发送 |
+| `ref_text` | 参考音频逐字稿；空则不发送 |
+| `fetch_remote_voices` | 默认 `false`；为 true 时尝试 `GET /v1/audio/voices?model=...` |
+
+### 参数差异
+
+| UI | Edge-TTS | OpenAI Compatible |
+|----|----------|-------------------|
+| voice | SSML voice | JSON `voice`（可空） |
+| rate | SSML `%` | `speed = clamp(1 + rate/100, 0.25, 4)` |
+| pitch | SSML Hz | **不发送**（UI 灰显） |
+| volume | SSML | 仅本地播放 |
+| instruct | 无 | JSON `instruct`（非空才发） |
+| ref_audio / ref_text | 无 | Qwen3-TTS Base 语音克隆（非空才发；有参考时省略 `voice`） |
+
+### 本地 mlx-audio / VoiceDesign 示例
+
+本机服务示例（需自行启动 `mlx-audio`）：
+
+```text
+TTS 源   = OpenAI 兼容
+Base URL = http://127.0.0.1:8081
+API Key  = （留空）
+Model    = mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16
+Voice    = （可留空）
+Instruct = 温柔女声，语速适中，带一点微笑感
+```
+
+等价 curl：
 
 ```bash
-# 安装 cargo-xwin
-cargo install cargo-xwin
-
-# 添加 Windows 目标架构
-rustup target add x86_64-pc-windows-msvc
-
-# 交叉编译
-cargo xwin build --release --target x86_64-pc-windows-msvc
+curl -X POST 'http://127.0.0.1:8081/v1/audio/speech' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
+    "input": "你好，这是音色定制测试。",
+    "instruct": "温柔女声，语速适中，带一点微笑感",
+    "response_format": "mp3",
+    "speed": 1.0
+  }' \
+  --output /tmp/mlx-tts-test.mp3
 ```
+
+> 说明：部分兼容服务的 models/voices 列表可能为空；客户端会直接携带完整 `model` 名请求合成。VoiceDesign 空 voice 列表属正常，请填写 Instruct。
+
+### 本地 mlx-audio / Base 语音克隆示例
+
+```text
+TTS 源    = OpenAI 兼容
+Base URL  = http://127.0.0.1:8081
+API Key   = （留空）
+Model     = mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16
+Voice     = （留空；有 ref 时即使填写也会被省略）
+Ref Audio = /absolute/path/to/reference.wav
+Ref Text  = 这是我说话的声音。
+```
+
+等价 curl：
+
+```bash
+curl -X POST 'http://127.0.0.1:8081/v1/audio/speech' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+    "input": "你好，这是语音克隆测试。",
+    "ref_audio": "/absolute/path/to/reference.wav",
+    "ref_text": "这是我说话的声音。",
+    "response_format": "mp3",
+    "speed": 1.0
+  }' \
+  --output /tmp/mlx-tts-clone.mp3
+```
+
+> `ref_audio` 按 mlx-audio 约定发送**服务端可读取的本地路径**（本机桌面客户端通常选本机绝对路径）。远程服务若不能访问该路径，克隆会失败。
+
+### ⚠ API Key 安全
+
+API Key 以**明文**写入用户配置目录下的 JSON（与现有配置持久化方式一致）。请勿把含真实 Key 的配置提交到版本库或分享给他人。本阶段未接入系统钥匙串。
 
 ---
 
 ## 🧪 自动化测试
 
-运行项目的单元测试与网络连通性测试：
-
 ```bash
+# 默认（含 URL/speed/instruct 序列化、旧配置兼容、Edge 回归）
 cargo test -- --nocapture
+
+# 本机 mlx-audio 集成（需 8081 已启动）
+OPENAI_BASE_URL=http://127.0.0.1:8081 \
+OPENAI_MODEL=mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16 \
+OPENAI_INSTRUCT='温柔女声，语速适中，带一点微笑感' \
+  cargo test test_openai_tts_synthesize_mlx_audio -- --ignored --nocapture
 ```
 
-测试覆盖：
-- `Sec-MS-GEC` v2 令牌（`<16 位 CS64>-<64 位 SHA256>`）动态生成、格式校验与已知向量比对
-- SSML 标签构建与 XML 转义验证
-- 音频输出设备枚举与系统默认设备检测
-- 真实 Edge-TTS WebSocket 语音合成与 MP3 数据流验证
-- 用户配置文件序列化与反序列化
+覆盖要点：
+- `Sec-MS-GEC` / SSML / Edge 合成回归
+- `join_speech_url` / `rate_to_speed` / `instruct` 条件序列化
+- 旧 `config.json` 缺少 `source`/`openai`/`instruct` 时仍可反序列化
 
 ---
 
 ## 📋 使用说明
 
-1. **输入文本**：在输入框中输入或点击“粘贴”写入待朗读文本。
-2. **选择音频输出设备**：
-   - 如果想正常听音，保持选择“默认音频输出设备”。
-   - 如果需要将声音推流给直播软件、OBS、Discord、或游戏语音，在下拉菜单中选择您的虚拟声卡（例如 `CABLE Input (VB-Audio Virtual Cable)`）。
-3. **选择语音与参数**：选择角色（支持在输入框快速筛选，如输入“云希”或“晓晓”），微调语速和音量。
-4. **朗读与停止**：
-   - 点击 **▶ 朗读 / 播放** 开始播放。
-   - 点击 **⏹ 停止播放** 即可立即停止当前发声。
-   - 点击 **💾 导出 MP3 文件** 将当前生成的音频直接保存至本地。
-5. **快捷键窗口最小化/唤出**：
-   - 默认按下 `Ctrl + Shift + T` 会将窗口最小化隐藏。
-   - 在其他软件中再次按下 `Ctrl + Shift + T`，窗口将瞬间还原并自动获取焦点。
-   - 点击右上角快捷键按钮可随时更改按键（如改为 `Alt + Space`、`F9` 等）。
+1. **选择 TTS 源**：顶部「TTS 源」选 Edge-TTS 或 OpenAI 兼容。
+2. **OpenAI 源**：填写 Base URL /（可选）API Key / Model；VoiceDesign 请填写 Instruct；voice 可留空或手填。
+3. **输入文本**并选择输出设备。
+4. **朗读 / 停止 / 导出 MP3**；`Cmd/Ctrl+Enter` 可朗读并清空输入。
+5. **全局快捷键**：默认 `Ctrl + Shift + T` 最小化/唤出窗口。

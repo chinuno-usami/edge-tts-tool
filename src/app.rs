@@ -1,9 +1,8 @@
 use crate::audio::{list_output_devices, AudioController, AudioDeviceInfo, AudioEvent};
-use crate::config::AppConfig;
-use crate::edge_tts::{
-    fetch_voices_list, get_preset_voices, synthesize, SpeakOptions, Voice,
-};
+use crate::config::{AppConfig, TtsSource};
+use crate::edge_tts::{self, SpeakOptions, Voice};
 use crate::hotkey::{AppHotkeyManager, HotkeyConfig};
+use crate::openai_tts;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use egui::{Align, Color32, Layout, RichText, ScrollArea, Vec2};
 use std::sync::Arc;
@@ -16,6 +15,13 @@ const SPEAK_SHORTCUT_LABEL: &str = if cfg!(target_os = "macos") {
 };
 const MIN_TEXT_HEIGHT: f32 = 120.0;
 const COMPACT_WIDTH: f32 = 640.0;
+
+const OPENAI_MODEL_PRESETS: &[&str] = &[
+    "tts-1",
+    "tts-1-hd",
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+];
 
 fn main_text_id() -> egui::Id {
     egui::Id::new("main_text_edit")
@@ -37,13 +43,25 @@ fn prosody_slider(
 }
 
 enum AsyncMessage {
-    VoicesLoaded(Vec<Voice>),
-    VoicesLoadFailed(String),
+    VoicesLoaded {
+        source: TtsSource,
+        generation: u64,
+        voices: Vec<Voice>,
+    },
+    VoicesLoadFailed {
+        source: TtsSource,
+        generation: u64,
+        error: String,
+    },
     SynthesisSuccess {
+        generation: u64,
         audio: Vec<u8>,
         auto_play: bool,
     },
-    SynthesisFailed(String),
+    SynthesisFailed {
+        generation: u64,
+        error: String,
+    },
 }
 
 pub struct TtsApp {
@@ -55,6 +73,8 @@ pub struct TtsApp {
     selected_voice_name: String,
     voice_filter: String,
     is_loading_voices: bool,
+    /// Bumped on each voice-list refresh to ignore stale async replies.
+    voice_fetch_generation: u64,
 
     // Cached dropdown data (recomputed only when the filter or voice list changes,
     // NOT on every frame — this used to be rebuilt every repaint).
@@ -79,6 +99,8 @@ pub struct TtsApp {
     status_color: Color32,
     is_playing: bool,
     is_synthesizing: bool,
+    /// Bumped on each synthesis start and source switch to ignore stale async results.
+    synthesis_generation: u64,
     last_audio: Option<Vec<u8>>,
     // Text cleared by the speak shortcut; restored if that synthesis fails.
     pending_cleared_text: Option<String>,
@@ -119,14 +141,26 @@ impl TtsApp {
             log::warn!("Initial hotkey registration notice: {}", e);
         }
 
-        let preset_voices = get_preset_voices();
-        let selected_voice_name = if preset_voices.iter().any(|v| v.short_name == config.voice) {
-            config.voice.clone()
-        } else {
-            preset_voices
-                .first()
-                .map(|v| v.short_name.clone())
-                .unwrap_or_else(|| "zh-CN-XiaoxiaoNeural".to_string())
+        let (preset_voices, selected_voice_name) = match config.source {
+            TtsSource::Edge => {
+                let presets = edge_tts::get_preset_voices();
+                let name = if presets.iter().any(|v| v.short_name == config.voice) {
+                    config.voice.clone()
+                } else if presets.iter().any(|v| v.short_name == config.edge_voice) {
+                    config.edge_voice.clone()
+                } else {
+                    presets
+                        .first()
+                        .map(|v| v.short_name.clone())
+                        .unwrap_or_else(|| "zh-CN-XiaoxiaoNeural".to_string())
+                };
+                (presets, name)
+            }
+            TtsSource::OpenAiCompatible => {
+                let presets = openai_tts::get_preset_voices();
+                let name = config.openai.voice.clone();
+                (presets, name)
+            }
         };
 
         let devices = list_output_devices();
@@ -142,6 +176,7 @@ impl TtsApp {
             voices: preset_voices,
             voice_filter: String::new(),
             is_loading_voices: false,
+            voice_fetch_generation: 0,
             filtered_voices: Vec::new(),
             selected_display: String::new(),
             text_len: config.last_text.chars().count(),
@@ -154,6 +189,7 @@ impl TtsApp {
             status_color: Color32::from_rgb(100, 180, 100),
             is_playing: false,
             is_synthesizing: false,
+            synthesis_generation: 0,
             last_audio: None,
             pending_cleared_text: None,
             hotkey_manager,
@@ -171,24 +207,33 @@ impl TtsApp {
             egui_ctx,
         };
 
-        // Populate the cached dropdown data for the preset voices.
         app.recompute_voice_cache();
 
-        // Fetch latest online voices in the background
-        app.refresh_voices_async();
+        match app.config.source {
+            TtsSource::Edge => {
+                app.is_loading_voices = true;
+                app.refresh_voices_async();
+            }
+            TtsSource::OpenAiCompatible => {
+                if app.config.openai.fetch_remote_voices {
+                    app.is_loading_voices = true;
+                    app.refresh_voices_async();
+                }
+            }
+        }
 
         app
     }
 
     fn refresh_devices(&mut self) {
         self.output_devices = list_output_devices();
-        self.status_text = format!("音频输出设备列表已刷新 (共 {} 个设备)", self.output_devices.len());
+        self.status_text = format!(
+            "音频输出设备列表已刷新 (共 {} 个设备)",
+            self.output_devices.len()
+        );
         self.status_color = Color32::LIGHT_BLUE;
     }
 
-    // Rebuild the cached voice-dropdown list. Called only when the filter text or the
-    // voice list actually changes, so the per-frame ui() path no longer does a full
-    // to_lowercase + filter + display_name(format!) + collect over hundreds of voices.
     fn recompute_voice_cache(&mut self) {
         let filter_lower = self.voice_filter.to_lowercase();
         self.filtered_voices = self
@@ -208,19 +253,105 @@ impl TtsApp {
             .iter()
             .find(|v| v.short_name == self.selected_voice_name)
             .map(|v| v.display_name())
-            .unwrap_or_else(|| self.selected_voice_name.clone());
+            .unwrap_or_else(|| {
+                if self.selected_voice_name.is_empty() {
+                    "（空 / 自定义）".to_string()
+                } else {
+                    format!("{} (自定义)", self.selected_voice_name)
+                }
+            });
     }
 
-    fn refresh_voices_async(&self) {
+    fn switch_source(&mut self, new_source: TtsSource) {
+        if self.config.source == new_source {
+            return;
+        }
+
+        // Invalidate in-flight synthesis / voice fetch so late replies cannot update the new source.
+        self.synthesis_generation = self.synthesis_generation.wrapping_add(1);
+        self.voice_fetch_generation = self.voice_fetch_generation.wrapping_add(1);
+        if self.is_synthesizing {
+            self.is_synthesizing = false;
+            if let Some(cleared) = self.pending_cleared_text.take() {
+                self.restore_cleared_text(cleared);
+            }
+        }
+        self.is_loading_voices = false;
+
+        match self.config.source {
+            TtsSource::Edge => {
+                self.config.edge_voice = self.selected_voice_name.clone();
+            }
+            TtsSource::OpenAiCompatible => {
+                self.config.openai.voice = self.selected_voice_name.clone();
+            }
+        }
+
+        self.config.source = new_source;
+        self.voice_filter.clear();
+
+        match self.config.source {
+            TtsSource::Edge => {
+                self.voices = edge_tts::get_preset_voices();
+                self.selected_voice_name = self.config.edge_voice.clone();
+                self.recompute_voice_cache();
+                self.persist_config();
+                self.is_loading_voices = true;
+                self.status_text = "已切换到 Edge-TTS，正在刷新云端语音...".to_string();
+                self.status_color = Color32::LIGHT_BLUE;
+                self.refresh_voices_async();
+            }
+            TtsSource::OpenAiCompatible => {
+                self.voices = openai_tts::get_preset_voices();
+                self.selected_voice_name = self.config.openai.voice.clone();
+                self.recompute_voice_cache();
+                self.persist_config();
+                self.status_text = "已切换到 OpenAI 兼容源".to_string();
+                self.status_color = Color32::LIGHT_BLUE;
+                if self.config.openai.fetch_remote_voices {
+                    self.is_loading_voices = true;
+                    self.refresh_voices_async();
+                }
+            }
+        }
+    }
+
+    fn refresh_voices_async(&mut self) {
+        self.voice_fetch_generation = self.voice_fetch_generation.wrapping_add(1);
+        let generation = self.voice_fetch_generation;
         let tx = self.async_tx.clone();
         let ctx = self.egui_ctx.clone();
+        let source = self.config.source.clone();
+        let openai_cfg = self.config.openai.clone();
+
         self.runtime.spawn(async move {
-            match fetch_voices_list().await {
+            let result = match source {
+                TtsSource::Edge => edge_tts::fetch_voices_list().await,
+                TtsSource::OpenAiCompatible => {
+                    if openai_cfg.fetch_remote_voices {
+                        // Propagate errors / empty lists so the UI can distinguish
+                        // success, empty remote catalog, and fallback-on-failure.
+                        openai_tts::fetch_voices_list(&openai_cfg).await
+                    } else {
+                        Ok(openai_tts::get_preset_voices())
+                    }
+                }
+            };
+
+            match result {
                 Ok(voices) => {
-                    let _ = tx.send(AsyncMessage::VoicesLoaded(voices));
+                    let _ = tx.send(AsyncMessage::VoicesLoaded {
+                        source,
+                        generation,
+                        voices,
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(AsyncMessage::VoicesLoadFailed(e.to_string()));
+                    let _ = tx.send(AsyncMessage::VoicesLoadFailed {
+                        source,
+                        generation,
+                        error: e.to_string(),
+                    });
                 }
             }
             ctx.request_repaint();
@@ -238,28 +369,86 @@ impl TtsApp {
             return;
         }
 
-        self.is_synthesizing = true;
-        self.status_text = "正在调用 Edge-TTS 生成音频...".to_string();
-        self.status_color = Color32::LIGHT_BLUE;
+        if matches!(self.config.source, TtsSource::OpenAiCompatible) {
+            if self.config.openai.base_url.trim().is_empty() {
+                self.status_text = "请填写 OpenAI 兼容源的 Base URL".to_string();
+                self.status_color = Color32::YELLOW;
+                return;
+            }
+            if self.config.openai.model.trim().is_empty() {
+                self.status_text = "请填写 OpenAI 兼容源的 Model".to_string();
+                self.status_color = Color32::YELLOW;
+                return;
+            }
+            if openai_tts::model_requires_voice(&self.config.openai.model)
+                && self.selected_voice_name.trim().is_empty()
+            {
+                self.status_text =
+                    "经典 TTS 模型（如 tts-1）需要选择或填写 Voice".to_string();
+                self.status_color = Color32::YELLOW;
+                return;
+            }
+            let ref_audio = self.config.openai.ref_audio.trim();
+            if !ref_audio.is_empty()
+                && openai_tts::model_supports_voice_clone_refs(&self.config.openai.model)
+                && !std::path::Path::new(ref_audio).is_file()
+            {
+                self.status_text =
+                    format!("参考音频文件不存在或不可读: {}", ref_audio);
+                self.status_color = Color32::YELLOW;
+                return;
+            }
+        }
 
-        let options = SpeakOptions {
-            voice: self.selected_voice_name.clone(),
-            rate: self.rate,
-            pitch: self.pitch,
-            volume: self.volume,
+        self.synthesis_generation = self.synthesis_generation.wrapping_add(1);
+        let generation = self.synthesis_generation;
+        self.is_synthesizing = true;
+        self.status_text = match self.config.source {
+            TtsSource::Edge => "正在调用 Edge-TTS 生成音频...".to_string(),
+            TtsSource::OpenAiCompatible => "正在合成音频...".to_string(),
         };
+        self.status_color = Color32::LIGHT_BLUE;
 
         let text = self.text.clone();
         let tx = self.async_tx.clone();
         let ctx = self.egui_ctx.clone();
+        let source = self.config.source.clone();
+        let rate = self.rate;
+        let pitch = self.pitch;
+        let volume = self.volume;
+        let voice = self.selected_voice_name.clone();
+        let mut openai_cfg = self.config.openai.clone();
+        openai_cfg.voice = voice.clone();
 
         self.runtime.spawn(async move {
-            match synthesize(&text, &options).await {
+            let result = match source {
+                TtsSource::Edge => {
+                    let options = SpeakOptions {
+                        voice,
+                        rate,
+                        pitch,
+                        volume,
+                    };
+                    edge_tts::synthesize(&text, &options).await
+                }
+                TtsSource::OpenAiCompatible => {
+                    openai_tts::synthesize(&text, rate, &openai_cfg).await
+                }
+            };
+
+            match result {
                 Ok(audio) => {
-                    let _ = tx.send(AsyncMessage::SynthesisSuccess { audio, auto_play });
+                    let _ = tx.send(AsyncMessage::SynthesisSuccess {
+                        generation,
+                        audio,
+                        auto_play,
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(AsyncMessage::SynthesisFailed(e.to_string()));
+                    let _ = tx.send(AsyncMessage::SynthesisFailed {
+                        generation,
+                        error: e.to_string(),
+                    });
                 }
             }
             ctx.request_repaint();
@@ -319,13 +508,41 @@ impl TtsApp {
     }
 
     fn persist_config(&mut self) {
-        self.config.voice = self.selected_voice_name.clone();
         self.config.output_device = self.selected_device_name.clone();
         self.config.rate = self.rate;
         self.config.pitch = self.pitch;
         self.config.volume = self.volume;
         self.config.last_text = self.text.clone();
+
+        match self.config.source {
+            TtsSource::Edge => {
+                // Keep legacy `voice` Edge-only for backward-compatible configs.
+                self.config.voice = self.selected_voice_name.clone();
+                self.config.edge_voice = self.selected_voice_name.clone();
+            }
+            TtsSource::OpenAiCompatible => {
+                self.config.openai.voice = self.selected_voice_name.clone();
+            }
+        }
+
         self.config.save();
+    }
+
+    /// VoiceDesign / Base models should not keep leftover classic voices like `alloy`.
+    fn clear_classic_voice_if_needed(&mut self) -> bool {
+        if !matches!(self.config.source, TtsSource::OpenAiCompatible) {
+            return false;
+        }
+        if !openai_tts::model_should_omit_classic_voice(&self.config.openai.model) {
+            return false;
+        }
+        if self.selected_voice_name.is_empty() && self.config.openai.voice.is_empty() {
+            return false;
+        }
+        self.selected_voice_name.clear();
+        self.config.openai.voice.clear();
+        self.recompute_voice_cache();
+        true
     }
 }
 
@@ -371,20 +588,71 @@ impl eframe::App for TtsApp {
         // 4. Poll async channel messages (voice loading & synthesis)
         while let Ok(msg) = self.async_rx.try_recv() {
             match msg {
-                AsyncMessage::VoicesLoaded(fetched_voices) => {
+                AsyncMessage::VoicesLoaded {
+                    source,
+                    generation,
+                    voices: fetched_voices,
+                } => {
+                    // Ignore stale replies from a previous TTS source / older refresh.
+                    if source != self.config.source
+                        || generation != self.voice_fetch_generation
+                    {
+                        continue;
+                    }
                     self.is_loading_voices = false;
                     if !fetched_voices.is_empty() {
                         self.voices = fetched_voices;
                         self.recompute_voice_cache();
-                        self.status_text = format!("已加载 Edge 云端语音 (共 {} 个)", self.voices.len());
+                        self.status_text = match self.config.source {
+                            TtsSource::Edge => {
+                                format!("已加载 Edge 云端语音 (共 {} 个)", self.voices.len())
+                            }
+                            TtsSource::OpenAiCompatible => {
+                                format!("已加载 OpenAI 兼容语音 (共 {} 个)", self.voices.len())
+                            }
+                        };
+                        self.status_color = Color32::LIGHT_BLUE;
+                    } else if matches!(self.config.source, TtsSource::OpenAiCompatible) {
+                        self.status_text =
+                            "远程语音列表为空，可留空 Voice 并使用 Instruct 定制音色".to_string();
                         self.status_color = Color32::LIGHT_BLUE;
                     }
                 }
-                AsyncMessage::VoicesLoadFailed(err) => {
+                AsyncMessage::VoicesLoadFailed {
+                    source,
+                    generation,
+                    error: err,
+                } => {
+                    if source != self.config.source
+                        || generation != self.voice_fetch_generation
+                    {
+                        continue;
+                    }
                     self.is_loading_voices = false;
                     log::warn!("Failed to load online voices: {}", err);
+                    match self.config.source {
+                        TtsSource::OpenAiCompatible => {
+                            self.voices = openai_tts::get_preset_voices();
+                            self.recompute_voice_cache();
+                            self.status_text =
+                                format!("远程语音拉取失败，已回退预设: {}", err);
+                            self.status_color = Color32::YELLOW;
+                        }
+                        TtsSource::Edge => {
+                            self.status_text =
+                                format!("云端语音拉取失败，仍使用本地预设: {}", err);
+                            self.status_color = Color32::YELLOW;
+                        }
+                    }
                 }
-                AsyncMessage::SynthesisSuccess { audio, auto_play } => {
+                AsyncMessage::SynthesisSuccess {
+                    generation,
+                    audio,
+                    auto_play,
+                } => {
+                    if generation != self.synthesis_generation {
+                        continue;
+                    }
                     self.is_synthesizing = false;
                     self.pending_cleared_text = None;
                     let size_kb = audio.len() as f64 / 1024.0;
@@ -401,7 +669,10 @@ impl eframe::App for TtsApp {
                         );
                     }
                 }
-                AsyncMessage::SynthesisFailed(err) => {
+                AsyncMessage::SynthesisFailed { generation, error: err } => {
+                    if generation != self.synthesis_generation {
+                        continue;
+                    }
                     self.is_synthesizing = false;
                     if let Some(cleared) = self.pending_cleared_text.take() {
                         self.restore_cleared_text(cleared);
@@ -415,7 +686,6 @@ impl eframe::App for TtsApp {
         }
 
         // 5. Ctrl/Cmd+Enter：朗读当前文本并清空输入（在 TextEdit 之前消费，避免插入换行）。
-        // 语音过滤框或快捷键弹窗获得焦点时不拦截；额外按下 Shift/Alt 时也不触发。
         let shortcut_allowed = !self.show_hotkey_dialog
             && ctx.memory(|m| m.focused()) != Some(voice_filter_id());
         let speak_shortcut = shortcut_allowed
@@ -428,7 +698,7 @@ impl eframe::App for TtsApp {
             self.speak_and_clear_text();
         }
 
-        // 6. Bottom action bar (always visible, wraps onto multiple rows when narrow)
+        // 6. Bottom action bar
         egui::TopBottomPanel::bottom("action_bar").show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
             ui.add_space(4.0);
@@ -490,8 +760,7 @@ impl eframe::App for TtsApp {
             ui.add_space(4.0);
         });
 
-        // 7. Central panel: scrolls as a whole when the window is too small,
-        // otherwise the text area stretches to fill the remaining height.
+        // 7. Central panel
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
             let viewport_height = ui.available_height();
@@ -517,7 +786,7 @@ impl TtsApp {
     fn show_settings(&mut self, ui: &mut egui::Ui) {
         // --- Top Header ---
         ui.horizontal_wrapped(|ui| {
-            ui.heading(RichText::new("🔊 Edge TTS 语音合成").strong());
+            ui.heading(RichText::new("🔊 TTS 语音合成").strong());
             let hotkey_str = self.config.hotkey.display_string();
             if ui
                 .button(RichText::new(format!("⌨ 快捷键: {}", hotkey_str)).size(12.0))
@@ -530,6 +799,47 @@ impl TtsApp {
         });
 
         ui.separator();
+
+        // --- TTS Source ---
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("📡 TTS 源:").strong());
+                let mut source = self.config.source.clone();
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("tts_source_combo")
+                    .selected_text(match source {
+                        TtsSource::Edge => "Edge-TTS",
+                        TtsSource::OpenAiCompatible => "OpenAI 兼容",
+                    })
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(&mut source, TtsSource::Edge, "Edge-TTS")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut source,
+                                TtsSource::OpenAiCompatible,
+                                "OpenAI 兼容",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                if changed {
+                    self.switch_source(source);
+                }
+            });
+        });
+
+        // --- OpenAI Compatible settings ---
+        if matches!(self.config.source, TtsSource::OpenAiCompatible) {
+            self.show_openai_settings(ui);
+        }
 
         // --- Audio Device Selection Bar ---
         ui.group(|ui| {
@@ -551,7 +861,10 @@ impl TtsApp {
                     .show_ui(ui, |ui| {
                         let is_default_selected = self.selected_device_name.is_none();
                         if ui
-                            .selectable_label(is_default_selected, "默认音频输出设备 (System Default)")
+                            .selectable_label(
+                                is_default_selected,
+                                "默认音频输出设备 (System Default)",
+                            )
                             .clicked()
                         {
                             selected_dev_to_set = Some(None);
@@ -564,7 +877,8 @@ impl TtsApp {
                                 dev.name.clone()
                             };
 
-                            let is_selected = self.selected_device_name.as_deref() == Some(&dev.name);
+                            let is_selected =
+                                self.selected_device_name.as_deref() == Some(&dev.name);
                             if ui.selectable_label(is_selected, label).clicked() {
                                 selected_dev_to_set = Some(Some(dev.name.clone()));
                             }
@@ -588,13 +902,12 @@ impl TtsApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("🗣 语音角色:").strong());
 
-                // Quick filter text input
                 let filter_width = (ui.available_width() * 0.35).clamp(120.0, 180.0);
                 let filter_changed = ui
                     .add(
                         egui::TextEdit::singleline(&mut self.voice_filter)
                             .id(voice_filter_id())
-                            .hint_text("🔍 过滤角色 (如 晓晓, 云希, en-US)...")
+                            .hint_text("🔍 过滤角色...")
                             .desired_width(filter_width),
                     )
                     .changed();
@@ -609,6 +922,14 @@ impl TtsApp {
                     .truncate()
                     .selected_text(self.selected_display.as_str())
                     .show_ui(ui, |ui| {
+                        if matches!(self.config.source, TtsSource::OpenAiCompatible) {
+                            if ui
+                                .selectable_label(self.selected_voice_name.is_empty(), "（留空）")
+                                .clicked()
+                            {
+                                selected_voice_to_set = Some(String::new());
+                            }
+                        }
                         for (short_name, display_name) in self.filtered_voices.iter() {
                             let is_selected = self.selected_voice_name == *short_name;
                             if ui.selectable_label(is_selected, display_name).clicked() {
@@ -619,21 +940,53 @@ impl TtsApp {
 
                 if let Some(new_voice) = selected_voice_to_set {
                     self.selected_voice_name = new_voice;
-                    // Sync the cached selected label so the collapsed combo shows
-                    // the newly picked voice (previously computed per-frame).
                     self.recompute_voice_cache();
                     self.persist_config();
                 }
 
+                if matches!(self.config.source, TtsSource::OpenAiCompatible) {
+                    let mut custom = self.selected_voice_name.clone();
+                    let custom_width = (ui.available_width() * 0.25).clamp(80.0, 160.0);
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut custom)
+                                .hint_text("自定义 voice")
+                                .desired_width(custom_width),
+                        )
+                        .changed()
+                    {
+                        self.selected_voice_name = custom;
+                        self.recompute_voice_cache();
+                        self.persist_config();
+                    }
+                }
+
+                let refresh_label = if matches!(self.config.source, TtsSource::Edge) {
+                    "☁ 刷新云端语音"
+                } else {
+                    "☁ 刷新语音列表"
+                };
+                let refresh_hover = if matches!(self.config.source, TtsSource::Edge) {
+                    "从 Microsoft Edge 服务器拉取最新完整语音列表"
+                } else {
+                    "加载 OpenAI 预设语音；若开启远程拉取则请求 /v1/audio/voices"
+                };
                 if ui
-                    .button("☁ 刷新云端语音")
-                    .on_hover_text("从 Microsoft Edge 服务器拉取最新完整语音列表")
+                    .button(refresh_label)
+                    .on_hover_text(refresh_hover)
                     .clicked()
                 {
                     self.is_loading_voices = true;
-                    self.status_text = "正在获取微软云端全部语音列表...".to_string();
+                    self.status_text = match self.config.source {
+                        TtsSource::Edge => "正在获取微软云端全部语音列表...".to_string(),
+                        TtsSource::OpenAiCompatible => "正在刷新 OpenAI 兼容语音列表...".to_string(),
+                    };
                     self.status_color = Color32::LIGHT_BLUE;
                     self.refresh_voices_async();
+                }
+
+                if self.is_loading_voices {
+                    ui.spinner();
                 }
             });
 
@@ -642,12 +995,202 @@ impl TtsApp {
         });
     }
 
-    // Sliders: Rate, Pitch, Volume. One row when wide, a label/slider grid when narrow.
+    fn show_openai_settings(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("⚙ OpenAI 兼容配置").strong());
+
+            let mut dirty = false;
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Base URL:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.config.openai.base_url)
+                        .hint_text("http://127.0.0.1:8081 或 https://api.openai.com")
+                        .desired_width((ui.available_width() - 20.0).clamp(200.0, 520.0)),
+                );
+                if resp.changed() || resp.lost_focus() {
+                    dirty = true;
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("API Key:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.config.openai.api_key)
+                        .password(true)
+                        .hint_text("本地服务可留空")
+                        .desired_width((ui.available_width() - 20.0).clamp(200.0, 520.0)),
+                );
+                // Persist only on blur so keystrokes are not written to disk every frame.
+                if resp.lost_focus() {
+                    dirty = true;
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Model:");
+                let model_width = (ui.available_width() - 120.0).clamp(180.0, 420.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.config.openai.model)
+                        .hint_text("tts-1 / VoiceDesign 全名")
+                        .desired_width(model_width),
+                );
+                if resp.changed() || resp.lost_focus() {
+                    let _ = self.clear_classic_voice_if_needed();
+                    dirty = true;
+                }
+
+                let mut picked: Option<&str> = None;
+                egui::ComboBox::from_id_salt("openai_model_preset")
+                    .selected_text("快捷")
+                    .show_ui(ui, |ui| {
+                        for m in OPENAI_MODEL_PRESETS {
+                            if ui
+                                .selectable_label(self.config.openai.model == *m, *m)
+                                .clicked()
+                            {
+                                picked = Some(*m);
+                            }
+                        }
+                    });
+                if let Some(m) = picked {
+                    self.config.openai.model = m.to_string();
+                    let _ = self.clear_classic_voice_if_needed();
+                    dirty = true;
+                }
+            });
+
+            ui.label("Instruct（音色描述）:");
+            let instruct_resp = ui.add(
+                egui::TextEdit::multiline(&mut self.config.openai.instruct)
+                    .hint_text("用自然语言描述目标音色，例如：温柔女声，语速适中，带一点微笑感")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
+            if instruct_resp.changed() || instruct_resp.lost_focus() {
+                dirty = true;
+            }
+
+            if self.config.openai.model.to_lowercase().contains("voicedesign")
+                && self.config.openai.instruct.trim().is_empty()
+            {
+                ui.label(
+                    RichText::new("提示：VoiceDesign 模型建议填写 Instruct 以定制音色")
+                        .size(12.0)
+                        .color(Color32::YELLOW),
+                );
+            }
+
+            if openai_tts::model_requires_voice(&self.config.openai.model)
+                && self.selected_voice_name.trim().is_empty()
+            {
+                ui.label(
+                    RichText::new("提示：tts-1 / tts-1-hd 等经典模型需要填写 Voice")
+                        .size(12.0)
+                        .color(Color32::YELLOW),
+                );
+            }
+
+            if openai_tts::model_supports_voice_clone_refs(&self.config.openai.model) {
+                ui.separator();
+                ui.label(RichText::new("🎙 语音克隆（Qwen3-TTS Base）").strong());
+                ui.label(
+                    RichText::new(
+                        "mlx-audio 需要能读取本地路径；克隆时请使用 Base 模型，且不要依赖 Voice",
+                    )
+                    .size(12.0)
+                    .color(Color32::GRAY),
+                );
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Ref Audio:");
+                    let path_width = (ui.available_width() - 140.0).clamp(160.0, 420.0);
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.config.openai.ref_audio)
+                            .hint_text("/path/to/reference.wav")
+                            .desired_width(path_width),
+                    );
+                    if resp.changed() || resp.lost_focus() {
+                        dirty = true;
+                    }
+                    if ui.button("选择…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter(
+                                "Audio",
+                                &["wav", "mp3", "flac", "m4a", "ogg", "aac"],
+                            )
+                            .pick_file()
+                        {
+                            self.config.openai.ref_audio = path.display().to_string();
+                            dirty = true;
+                        }
+                    }
+                    if ui.button("清除").clicked() {
+                        self.config.openai.ref_audio.clear();
+                        dirty = true;
+                    }
+                });
+
+                ui.label("Ref Text（参考音频逐字稿）:");
+                let ref_text_resp = ui.add(
+                    egui::TextEdit::multiline(&mut self.config.openai.ref_text)
+                        .hint_text("与参考音频内容一致的文本，例如：这是我说话的声音。")
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                if ref_text_resp.changed() || ref_text_resp.lost_focus() {
+                    dirty = true;
+                }
+
+                let has_refs = !self.config.openai.ref_audio.trim().is_empty()
+                    || !self.config.openai.ref_text.trim().is_empty();
+                if has_refs && !self.selected_voice_name.trim().is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "提示：已填写克隆参考时，请求将省略 Voice，避免与 Base 模型冲突",
+                        )
+                        .size(12.0)
+                        .color(Color32::YELLOW),
+                    );
+                }
+                if self.config.openai.model.to_lowercase().contains("base")
+                    && self.config.openai.ref_audio.trim().is_empty()
+                {
+                    ui.label(
+                        RichText::new("提示：Base 语音克隆建议选择 Ref Audio，并尽量填写 Ref Text")
+                            .size(12.0)
+                            .color(Color32::YELLOW),
+                    );
+                }
+            }
+
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(
+                        &mut self.config.openai.fetch_remote_voices,
+                        "尝试拉取远程 voices",
+                    )
+                    .changed()
+                {
+                    dirty = true;
+                }
+            });
+
+            if dirty {
+                self.persist_config();
+            }
+        });
+    }
+
+    // Sliders: Rate, Pitch, Volume. Pitch disabled for OpenAI compatible source.
     fn show_prosody_controls(&mut self, ui: &mut egui::Ui) {
         let compact = ui.available_width() < COMPACT_WIDTH;
         if compact {
             ui.spacing_mut().slider_width = (ui.available_width() - 140.0).clamp(80.0, 320.0);
         }
+
+        let openai = matches!(self.config.source, TtsSource::OpenAiCompatible);
 
         let body = |ui: &mut egui::Ui| {
             let separate = |ui: &mut egui::Ui| {
@@ -659,8 +1202,16 @@ impl TtsApp {
             };
             let rate = prosody_slider(ui, "语速:", &mut self.rate, -50..=100, "%");
             separate(ui);
-            let pitch = prosody_slider(ui, "音调:", &mut self.pitch, -50..=50, "Hz");
+
+            ui.label("音调:");
+            let pitch = ui
+                .add_enabled(
+                    !openai,
+                    egui::Slider::new(&mut self.pitch, -50..=50).suffix("Hz"),
+                )
+                .on_disabled_hover_text("当前源请用 Instruct 定制音色，不使用音调滑条");
             separate(ui);
+
             let volume = prosody_slider(ui, "音量:", &mut self.volume, 0..=100, "%");
             separate(ui);
             if compact {
@@ -722,7 +1273,6 @@ impl TtsApp {
             });
         });
 
-        // The header row above is not yet counted in remaining_height.
         let header_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
         let text_height = (remaining_height - header_height - 8.0).max(MIN_TEXT_HEIGHT);
 
