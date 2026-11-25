@@ -1,5 +1,5 @@
 use crate::audio::{list_output_devices, AudioController, AudioDeviceInfo, AudioEvent};
-use crate::config::{AppConfig, TtsSource};
+use crate::config::{AppConfig, OpenAiConfig, TtsSource};
 use crate::edge_tts::{self, SpeakOptions, Voice};
 use crate::hotkey::{AppHotkeyManager, HotkeyConfig};
 use crate::openai_tts;
@@ -1060,6 +1060,85 @@ impl TtsApp {
             );
             if instruct_resp.changed() || instruct_resp.lost_focus() {
                 dirty = true;
+            }
+
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("采样参数（mlx-audio / Qwen3-TTS；未勾选则使用服务端默认）")
+                    .size(12.0)
+                    .color(Color32::GRAY),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let mut temp_enabled = self.config.openai.temperature.is_some();
+                if ui.checkbox(&mut temp_enabled, "Temperature").changed() {
+                    self.config.openai.temperature = if temp_enabled {
+                        Some(0.7)
+                    } else {
+                        None
+                    };
+                    dirty = true;
+                }
+                if let Some(temp) = self.config.openai.temperature.as_mut() {
+                    let resp = ui.add(
+                        egui::Slider::new(
+                            temp,
+                            OpenAiConfig::TEMPERATURE_MIN..=OpenAiConfig::TEMPERATURE_MAX,
+                        )
+                        .fixed_decimals(2),
+                    );
+                    // Keep in-memory value while dragging; persist only on commit
+                    // (same pattern as prosody sliders).
+                    if resp.changed() {
+                        *temp = temp.clamp(
+                            OpenAiConfig::TEMPERATURE_MIN,
+                            OpenAiConfig::TEMPERATURE_MAX,
+                        );
+                    }
+                    if resp.drag_stopped() || resp.lost_focus() || resp.clicked() {
+                        *temp = temp.clamp(
+                            OpenAiConfig::TEMPERATURE_MIN,
+                            OpenAiConfig::TEMPERATURE_MAX,
+                        );
+                        dirty = true;
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Label::new("服务端默认"));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let mut top_p_enabled = self.config.openai.top_p.is_some();
+                if ui.checkbox(&mut top_p_enabled, "Top P").changed() {
+                    self.config.openai.top_p = if top_p_enabled {
+                        Some(0.9)
+                    } else {
+                        None
+                    };
+                    dirty = true;
+                }
+                if let Some(top_p) = self.config.openai.top_p.as_mut() {
+                    let resp = ui.add(
+                        egui::Slider::new(top_p, OpenAiConfig::TOP_P_MIN..=OpenAiConfig::TOP_P_MAX)
+                            .fixed_decimals(2),
+                    );
+                    if resp.changed() {
+                        *top_p = top_p.clamp(OpenAiConfig::TOP_P_MIN, OpenAiConfig::TOP_P_MAX);
+                    }
+                    if resp.drag_stopped() || resp.lost_focus() || resp.clicked() {
+                        *top_p = top_p.clamp(OpenAiConfig::TOP_P_MIN, OpenAiConfig::TOP_P_MAX);
+                        dirty = true;
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Label::new("服务端默认"));
+                }
+            });
+            if !openai_tts::model_supports_sampling_params(&self.config.openai.model)
+                && (self.config.openai.temperature.is_some() || self.config.openai.top_p.is_some())
+            {
+                ui.label(
+                    RichText::new("提示：经典 tts-1 / tts-1-hd 不会发送 Temperature / Top P")
+                        .size(12.0)
+                        .color(Color32::YELLOW),
+                );
             }
 
             if self.config.openai.model.to_lowercase().contains("voicedesign")

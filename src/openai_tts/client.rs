@@ -18,16 +18,28 @@ pub fn rate_to_speed(rate: i32) -> f32 {
     ((1.0 + rate as f32 / 100.0).clamp(0.25, 4.0) * 100.0).round() / 100.0
 }
 
+/// Classic OpenAI Speech models (`tts-1` / `tts-1-hd`, or empty model).
+/// These endpoints reject unknown extension fields such as `instruct` / sampling params.
+pub fn model_is_classic_openai_speech(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    matches!(m.as_str(), "" | "tts-1" | "tts-1-hd")
+}
+
 /// Classic OpenAI Speech models reject unknown fields such as `instruct`.
 pub fn model_supports_instruct(model: &str) -> bool {
-    let m = model.trim().to_ascii_lowercase();
-    !matches!(m.as_str(), "" | "tts-1" | "tts-1-hd")
+    !model_is_classic_openai_speech(model)
+}
+
+/// mlx-audio / Qwen3-TTS style sampling (`temperature` / `top_p`).
+/// Currently the same exclusion set as classic Speech; kept as a separate predicate
+/// so instruct support and sampling support can diverge later.
+pub fn model_supports_sampling_params(model: &str) -> bool {
+    !model_is_classic_openai_speech(model)
 }
 
 /// Classic Speech models require a non-empty `voice`; VoiceDesign-style models may omit it.
 pub fn model_requires_voice(model: &str) -> bool {
-    let m = model.trim().to_ascii_lowercase();
-    matches!(m.as_str(), "tts-1" | "tts-1-hd")
+    model_is_classic_openai_speech(model) && !model.trim().is_empty()
 }
 
 /// mlx-audio / Qwen3-TTS Base voice-clone extensions (`ref_audio` / `ref_text`).
@@ -69,6 +81,10 @@ pub struct OpenAiSpeechRequest<'a> {
     pub ref_audio: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
     pub response_format: &'a str,
     pub speed: f32,
 }
@@ -116,6 +132,19 @@ impl<'a> OpenAiSpeechRequest<'a> {
                 Some(i)
             }
         };
+        // Classic OpenAI Speech models reject unknown sampling fields.
+        let temperature = if model_supports_sampling_params(model) {
+            cfg.temperature
+                .map(|t| t.clamp(OpenAiConfig::TEMPERATURE_MIN, OpenAiConfig::TEMPERATURE_MAX))
+        } else {
+            None
+        };
+        let top_p = if model_supports_sampling_params(model) {
+            cfg.top_p
+                .map(|p| p.clamp(OpenAiConfig::TOP_P_MIN, OpenAiConfig::TOP_P_MAX))
+        } else {
+            None
+        };
         Self {
             model,
             input: text,
@@ -123,6 +152,8 @@ impl<'a> OpenAiSpeechRequest<'a> {
             instruct,
             ref_audio,
             ref_text,
+            temperature,
+            top_p,
             response_format: "mp3",
             speed: rate_to_speed(rate),
         }
@@ -351,12 +382,61 @@ mod tests {
             model: "tts-1".to_string(),
             voice: "alloy".to_string(),
             instruct: "should not be sent".to_string(),
+            temperature: Some(0.8),
+            top_p: Some(0.95),
             ..OpenAiConfig::default()
         };
         let req = OpenAiSpeechRequest::from_parts("hello", 0, &cfg);
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("instruct").is_none());
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("top_p").is_none());
         assert_eq!(json["voice"], "alloy");
+    }
+
+    #[test]
+    fn test_request_json_with_temperature_and_top_p() {
+        let cfg = OpenAiConfig {
+            model: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16".to_string(),
+            voice: String::new(),
+            temperature: Some(0.8),
+            top_p: Some(0.95),
+            ..OpenAiConfig::default()
+        };
+        let req = OpenAiSpeechRequest::from_parts("你好", 0, &cfg);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!((json["temperature"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+        assert!((json["top_p"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_request_json_omits_unset_temperature_and_top_p() {
+        let cfg = OpenAiConfig {
+            model: "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16".to_string(),
+            instruct: "温柔女声".to_string(),
+            temperature: None,
+            top_p: None,
+            ..OpenAiConfig::default()
+        };
+        let req = OpenAiSpeechRequest::from_parts("你好", 0, &cfg);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("top_p").is_none());
+    }
+
+    #[test]
+    fn test_request_json_clamps_temperature_and_top_p() {
+        let cfg = OpenAiConfig {
+            model: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16".to_string(),
+            voice: String::new(),
+            temperature: Some(5.0),
+            top_p: Some(-0.1),
+            ..OpenAiConfig::default()
+        };
+        let req = OpenAiSpeechRequest::from_parts("你好", 0, &cfg);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!((json["temperature"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+        assert!((json["top_p"].as_f64().unwrap() - 0.0).abs() < 1e-6);
     }
 
     #[test]

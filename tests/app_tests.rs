@@ -99,6 +99,8 @@ mod tests {
         assert_eq!(cfg.openai.instruct, deserialized.openai.instruct);
         assert_eq!(cfg.openai.ref_audio, deserialized.openai.ref_audio);
         assert_eq!(cfg.openai.ref_text, deserialized.openai.ref_text);
+        assert_eq!(cfg.openai.temperature, deserialized.openai.temperature);
+        assert_eq!(cfg.openai.top_p, deserialized.openai.top_p);
     }
 
     #[test]
@@ -126,6 +128,8 @@ mod tests {
         assert!(cfg.openai.instruct.is_empty());
         assert!(cfg.openai.ref_audio.is_empty());
         assert!(cfg.openai.ref_text.is_empty());
+        assert!(cfg.openai.temperature.is_none());
+        assert!(cfg.openai.top_p.is_none());
         assert!(!cfg.openai.fetch_remote_voices);
         // Raw serde leaves edge_voice at its field default until migration runs.
         assert_eq!(cfg.edge_voice, "zh-CN-XiaoxiaoNeural");
@@ -178,6 +182,45 @@ mod tests {
     }
 
     #[test]
+    fn test_config_normalizes_out_of_range_sampling() {
+        let raw = r#"{
+            "voice": "alloy",
+            "output_device": null,
+            "rate": 0,
+            "pitch": 0,
+            "volume": 100,
+            "hotkey": {
+                "ctrl": true,
+                "alt": false,
+                "shift": true,
+                "meta": false,
+                "key": "KeyT"
+            },
+            "last_text": "hello",
+            "source": "open_ai_compatible",
+            "openai": {
+                "base_url": "http://127.0.0.1:8081",
+                "api_key": "",
+                "model": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+                "voice": "",
+                "temperature": 5.0,
+                "top_p": -0.1
+            },
+            "edge_voice": "zh-CN-XiaoxiaoNeural"
+        }"#;
+
+        let raw_cfg: AppConfig =
+            serde_json::from_str(raw).expect("out-of-range sampling must deserialize");
+        assert_eq!(raw_cfg.openai.temperature, Some(5.0));
+        assert_eq!(raw_cfg.openai.top_p, Some(-0.1));
+
+        let cfg = AppConfig::from_json_value(serde_json::from_str(raw).expect("json value"))
+            .expect("normalized config");
+        assert_eq!(cfg.openai.temperature, Some(2.0));
+        assert_eq!(cfg.openai.top_p, Some(0.0));
+    }
+
+    #[test]
     fn test_openai_url_and_speed_helpers() {
         assert_eq!(
             openai_tts::join_speech_url("http://127.0.0.1:8081"),
@@ -190,6 +233,11 @@ mod tests {
             "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16"
         ));
         assert!(!openai_tts::model_supports_instruct("tts-1-hd"));
+        assert!(openai_tts::model_is_classic_openai_speech("tts-1"));
+        assert!(!openai_tts::model_supports_sampling_params("tts-1"));
+        assert!(openai_tts::model_supports_sampling_params(
+            "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
+        ));
         assert!(openai_tts::model_supports_voice_clone_refs(
             "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
         ));
@@ -269,6 +317,12 @@ mod tests {
             instruct,
             ref_audio: std::env::var("OPENAI_REF_AUDIO").unwrap_or_default(),
             ref_text: std::env::var("OPENAI_REF_TEXT").unwrap_or_default(),
+            temperature: std::env::var("OPENAI_TEMPERATURE")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            top_p: std::env::var("OPENAI_TOP_P")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             fetch_remote_voices: false,
         };
 

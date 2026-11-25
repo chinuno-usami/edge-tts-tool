@@ -12,7 +12,7 @@
 ## ✨ 核心特性
 
 - 🎙 **双 TTS 源**：Edge-TTS 与 OpenAI Compatible 可在 UI 中一键切换；旧配置默认仍走 Edge。
-- 🧪 **本地大模型友好**：API Key 可留空；支持扩展字段 **`instruct`**（自然语言音色描述），适配 Qwen3-TTS VoiceDesign。
+- 🧪 **本地大模型友好**：API Key 可留空；支持扩展字段 **`instruct`**（自然语言音色描述）以及可选 **`temperature` / `top_p`**，适配 Qwen3-TTS VoiceDesign / Base。
 - 🎧 **指定输出设备路由**：枚举系统音频输出，可路由到扬声器、耳机或虚拟声卡（VB-Cable / Voicemeeter 等）。
 - ⌨ **全局快捷键呼出/隐藏**：默认 `Ctrl + Shift + T`，可自定义。
 - 🎚 **参数调节**：
@@ -74,6 +74,8 @@ Windows Release 产物：`target\release\edge-tts-tool.exe`（crate 名暂未改
 | `instruct` | 自然语言音色/风格描述；空则不发送该 JSON 字段 |
 | `ref_audio` | 语音克隆参考音频的**服务端路径**（由 mlx-audio 所在机器读取；客户端不做存在性校验）；空则不发送 |
 | `ref_text` | 参考音频逐字稿；空则不发送 |
+| `temperature` | 可选；采样温度（建议 0–2）。`null`/缺省则不发送，使用服务端默认 |
+| `top_p` | 可选；nucleus sampling（0–1）。`null`/缺省则不发送，使用服务端默认 |
 | `fetch_remote_voices` | 默认 `false`；为 true 时尝试 `GET /v1/audio/voices?model=...` |
 
 ### 参数差异
@@ -85,6 +87,7 @@ Windows Release 产物：`target\release\edge-tts-tool.exe`（crate 名暂未改
 | pitch | SSML Hz | **不发送**（UI 灰显） |
 | volume | SSML | 仅本地播放 |
 | instruct | 无 | JSON `instruct`（非空才发） |
+| temperature / top_p | 无 | mlx-audio / Qwen3-TTS 采样参数（勾选后才发；经典 tts-1 不发） |
 | ref_audio / ref_text | 无 | Qwen3-TTS Base 语音克隆（非空才发；有参考时省略 `voice`） |
 
 ### 本地 mlx-audio / VoiceDesign 示例

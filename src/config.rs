@@ -52,6 +52,13 @@ pub struct OpenAiConfig {
     /// Exact transcript of `ref_audio`; sent as JSON `ref_text` when non-empty.
     #[serde(default)]
     pub ref_text: String,
+    /// Optional sampling temperature for mlx-audio / Qwen3-TTS style servers.
+    /// `None` means omit the field and use the server default.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Optional top_p nucleus sampling; `None` means omit / server default.
+    #[serde(default)]
+    pub top_p: Option<f32>,
     /// When true, try GET /v1/audio/voices?model=...; default off.
     #[serde(default)]
     pub fetch_remote_voices: bool,
@@ -67,7 +74,27 @@ impl Default for OpenAiConfig {
             instruct: String::new(),
             ref_audio: String::new(),
             ref_text: String::new(),
+            temperature: None,
+            top_p: None,
             fetch_remote_voices: false,
+        }
+    }
+}
+
+impl OpenAiConfig {
+    /// Inclusive sampling ranges shared by config normalization, UI sliders, and request building.
+    pub const TEMPERATURE_MIN: f32 = 0.0;
+    pub const TEMPERATURE_MAX: f32 = 2.0;
+    pub const TOP_P_MIN: f32 = 0.0;
+    pub const TOP_P_MAX: f32 = 1.0;
+
+    /// Clamp optional sampling fields into the ranges used by the UI / request builder.
+    pub fn normalize_sampling(&mut self) {
+        if let Some(t) = self.temperature.as_mut() {
+            *t = (*t).clamp(Self::TEMPERATURE_MIN, Self::TEMPERATURE_MAX);
+        }
+        if let Some(p) = self.top_p.as_mut() {
+            *p = (*p).clamp(Self::TOP_P_MIN, Self::TOP_P_MAX);
         }
     }
 }
@@ -125,6 +152,7 @@ impl AppConfig {
     pub fn from_json_value(value: serde_json::Value) -> Option<Self> {
         let mut cfg = serde_json::from_value::<AppConfig>(value.clone()).ok()?;
         Self::apply_migrations(&value, &mut cfg);
+        cfg.openai.normalize_sampling();
         Some(cfg)
     }
 
